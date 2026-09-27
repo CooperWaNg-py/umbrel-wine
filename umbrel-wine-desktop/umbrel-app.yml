@@ -9,7 +9,7 @@ manifestVersion: "2.0.0"
 id: umbrel-wine-desktop
 category: developer
 name: Wine
-version: "0.1.0"
+version: "0.2.0"
 tagline: Run Windows programs in your browser
 description: >-
   REQUIRES umbrelOS 2.0 AND OPENS OVER HTTPS. The desktop is streamed as video
@@ -24,6 +24,12 @@ description: >-
   are uploaded into drives: each drive is a separate Windows environment with its
   own C: drive, registry and installed programs. A `main` drive exists by
   default; create more for other tasks, and reset or delete them at any time.
+
+
+  Programs that need DLLs or data files next to them can be uploaded as a whole
+  folder; each .exe runs from its own folder. The built-in file browser shows a
+  drive's files and its C: drive, and opens settings files (.ini, .cfg, registry
+  and other text files) in an editor.
 
 
   On a Raspberry Pi, x86 programs are emulated with box64. They run much slower
@@ -52,4 +58,15 @@ path: ""
 submitter: CooperWaNg-py
 submission: https://github.com/CooperWaNg-py/umbrel-wine
 releaseNotes: >-
-  Initial release.
+  Upload whole folders: programs that need DLLs, data or config files next to
+  their .exe can now be dropped or picked as a folder, and every .exe inside it
+  can be run from the Files list. Each program starts in its own folder.
+
+  Browse drive files: a file browser for each drive (uploads, the C: drive and
+  the registry files) with download, upload into any folder, delete, and a text
+  editor for configuration files. Files keep their original encoding and line
+  endings, and a save is refused if Wine changed the file while it was open.
+
+  Installed programs started from their shortcut are now tracked until they
+  exit, so Stop works on them, and crashing programs no longer leave large core
+  dump files in the drive.

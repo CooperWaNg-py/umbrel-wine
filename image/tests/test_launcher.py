@@ -38,7 +38,7 @@ if [ "$server" = 0 ] && [ "$1" = "wineboot" ]; then
   mkdir -p "$root/drives/$drive/prefix"
   echo "WINE REGISTRY Version 2" > "$root/drives/$drive/prefix/system.reg"
 fi
-if [ "$server" = 0 ]; then echo "ran $*"; fi
+if [ "$server" = 0 ]; then echo "ran $* in $(pwd -P)"; fi
 exit 0
 """
 
@@ -105,11 +105,33 @@ def make_lnk(target: str, args: str = "", workdir: str = "") -> bytes:
 
 
 class HelperTests(unittest.TestCase):
-    def test_validate_upload_name(self):
-        for bad in ("../a.exe", ".a.exe", "a.txt", "a/b.exe", "", "a.exe/"):
-            self.assertFalse(launcher.validate_upload_name(bad), bad)
-        for good in ("Setup (x64).exe", "putty.exe", "7z2409-x64.EXE"):
-            self.assertTrue(launcher.validate_upload_name(good), good)
+    def test_validate_upload_path(self):
+        for bad in ("../a.exe", ".a.exe", "a.txt", "", "a.exe/", "Game/.DS_Store",
+                    "Game/../x.exe", "Game//x.dll", "Game/a:b", "Game/a\\b", "Game/x.",
+                    "Game/x ", "Game/tab\there", None):
+            self.assertIsNone(launcher.validate_upload_path(bad), bad)
+        self.assertEqual(launcher.validate_upload_path("Setup (x64).exe"), ["Setup (x64).exe"])
+        self.assertEqual(launcher.validate_upload_path("7z2409-x64.EXE"), ["7z2409-x64.EXE"])
+        self.assertEqual(launcher.validate_upload_path("Game/data/Über level.pak"),
+                         ["Game", "data", "Über level.pak"])
+
+    def test_text_round_trips_byte_for_byte(self):
+        samples = {
+            b"\xff\xfe" + "[fonts]\r\nA=1\r\n".encode("utf-16-le"): ("utf-16-le", "\r\n"),
+            b"\xef\xbb\xbf" + "x=ü\n".encode(): ("utf-8-bom", "\n"),
+            "k=ü\r\n".encode(): ("utf-8", "\r\n"),
+            b"name=caf\xe9\r\n": ("cp1252", "\r\n"),
+            b"odd=\x81\x8d": ("latin-1", "\n"),  # bytes cp1252 leaves undefined
+        }
+        for data, (encoding, newline) in samples.items():
+            decoded = launcher.decode_text(data)
+            self.assertEqual((decoded["encoding"], decoded["newline"]), (encoding, newline), data)
+            self.assertNotIn("\r", decoded["text"])
+            self.assertEqual(launcher.encode_text(**decoded), data)
+        self.assertIsNone(launcher.decode_text(b"MZ\x90\x00\x03"))
+        with self.assertRaises(UnicodeEncodeError):
+            launcher.encode_text("€", "latin-1", "\n")
+
 
     def test_validate_drive_name(self):
         self.assertTrue(launcher.validate_drive_name("main"))
@@ -220,6 +242,126 @@ class ApiTests(unittest.TestCase):
     def files_dir(self):
         return self.root / "drives" / "main" / "files"
 
+    def wait_log(self, run_id):
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            _, log = self.request("GET", f"/api/runs/{run_id}/log")
+            if log:
+                return log
+            time.sleep(0.05)
+        raise AssertionError(f"run {run_id} never logged anything")
+
+    def fs(self, method, endpoint, body=None, **query):
+        from urllib.parse import urlencode
+        return self.request(method, f"/api/drives/main/fs{endpoint}?{urlencode(query)}", body)
+
+    def test_folder_upload_listing_run_delete(self):
+        base = "/api/drives/main/files/"
+        status, _ = self.request("PUT", base + "Game%2Fbin%2Fgame.exe", b"MZgame")
+        self.assertEqual(status, 201)
+        # Literal slashes work too; non-.exe files inside a folder are not MZ-checked.
+        status, _ = self.request("PUT", base + "Game/data/level%201.pak", b"\0\1data")
+        self.assertEqual(status, 201)
+        status, body = self.request("PUT", base + "Game%2Fbin%2Fhelper.exe", b"notmz")
+        self.assertEqual((status, body["error"]), (415, "not_a_windows_executable"))
+        status, body = self.request("PUT", base + "Game%2Fbin%2Fgame.exe%2Fx.dll", b"x")
+        self.assertEqual((status, body["error"]), (409, "exists"))
+
+        main = self.drive("main")
+        self.assertNotIn("Game", [f["name"] for f in main["files"]])
+        self.assertIn({"name": "Game", "size": 12, "file_count": 2,
+                       "executables": ["Game/bin/game.exe"]}, main["folders"])
+
+        # A file added through the browser shows up at once (cache invalidated).
+        status, _ = self.fs("PUT", "/upload", b"cfg", path="files/Game", name="game.cfg")
+        self.assertEqual(status, 201)
+        game = next(f for f in self.drive("main")["folders"] if f["name"] == "Game")
+        self.assertEqual(game["file_count"], 3)
+
+        # The program runs in its own folder so it finds its DLLs and data.
+        status, body = self.request("POST", "/api/drives/main/run", {"file": "Game/bin/game.exe"})
+        self.assertEqual(status, 201)
+        bin_dir = (self.files_dir() / "Game/bin").resolve()
+        self.assertEqual(self.wait_log(body["id"]).strip(),
+                         f"ran {self.files_dir() / 'Game/bin/game.exe'} in {bin_dir}".encode())
+
+        status, _ = self.request("DELETE", base + "Game")
+        self.assertEqual(status, 204)
+        self.assertFalse((self.files_dir() / "Game").exists())
+        self.assertEqual([f for f in self.drive("main")["folders"] if f["name"] == "Game"], [])
+
+    def test_browse_follows_links_only_inside_the_drive(self):
+        dosdevices = self.root / "drives/main/prefix/dosdevices"
+        dosdevices.mkdir(exist_ok=True)
+        (dosdevices.parent / "drive_c").mkdir(exist_ok=True)
+        for name, target in (("c:", "../drive_c"), ("z:", "/")):
+            if not (dosdevices / name).is_symlink():
+                (dosdevices / name).symlink_to(target)
+        status, root = self.fs("GET", "/list", path="")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["name"] for e in root["entries"]][:2], ["files", "prefix"])
+        _, listing = self.fs("GET", "/list", path="prefix/dosdevices")
+        types = {e["name"]: (e["type"], e["link"]) for e in listing["entries"]}
+        self.assertEqual(types["c:"], ("dir", True))
+        self.assertEqual(types["z:"], ("link", True))
+        status, _ = self.fs("GET", "/list", path="prefix/dosdevices/c:")
+        self.assertEqual(status, 200)
+        for path in ("prefix/dosdevices/z:", "prefix/dosdevices/z:/etc"):
+            status, body = self.fs("GET", "/list", path=path)
+            self.assertEqual((status, body["error"]), (404, "no_such_file"), path)
+        for path in ("..", "prefix/../..", "/etc"):
+            status, body = self.fs("GET", "/list", path=path)
+            self.assertEqual((status, body["error"]), (400, "invalid_path"), path)
+        # Deleting a link removes only the link.
+        status, _ = self.fs("DELETE", "", path="prefix/dosdevices/z:")
+        self.assertEqual(status, 204)
+        self.assertFalse((dosdevices / "z:").is_symlink())
+        self.assertTrue(Path("/etc").exists())
+
+    def test_edit_text_file_keeps_encoding_and_detects_changes(self):
+        ini = self.root / "drives/main/prefix/drive_c/windows/win.ini"
+        ini.parent.mkdir(parents=True, exist_ok=True)
+        ini.write_bytes(b"\xff\xfe" + "[fonts]\r\n".encode("utf-16-le"))
+        status, doc = self.fs("GET", "/text", path="prefix/drive_c/windows/win.ini")
+        self.assertEqual(status, 200)
+        self.assertEqual((doc["text"], doc["encoding"], doc["newline"]), ("[fonts]\n", "utf-16-le", "\r\n"))
+        save = {**doc, "text": "[fonts]\n[desktop]\n"}
+        status, saved = self.fs("PUT", "/text", {k: save[k] for k in ("path", "text", "encoding", "newline", "mtime_ns")})
+        self.assertEqual(status, 200)
+        self.assertEqual(ini.read_bytes(), b"\xff\xfe" + "[fonts]\r\n[desktop]\r\n".encode("utf-16-le"))
+        # Saving again from the stale copy is refused, e.g. after Wine rewrote the file.
+        status, body = self.fs("PUT", "/text", {k: save[k] for k in ("path", "text", "encoding", "newline", "mtime_ns")})
+        self.assertEqual((status, body["error"]), (409, "changed"))
+        status, body = self.fs("PUT", "/text", {**{k: save[k] for k in ("path", "encoding", "newline")},
+                                               "text": "\U0001F600", "mtime_ns": saved["mtime_ns"], "encoding": "cp1252"})
+        self.assertEqual((status, body["error"]), (400, "unencodable"))
+        (ini.parent / "bin.dat").write_bytes(b"\x00\x01\x02")
+        status, body = self.fs("GET", "/text", path="prefix/drive_c/windows/bin.dat")
+        self.assertEqual((status, body["error"]), (415, "not_text"))
+        status, data = self.fs("GET", "/download", path="prefix/drive_c/windows/bin.dat")
+        self.assertEqual((status, data), (200, b"\x00\x01\x02"))
+
+    def test_browser_upload_and_protected_folders(self):
+        (self.root / "drives/main/prefix/drive_c").mkdir(parents=True, exist_ok=True)
+        status, body = self.fs("PUT", "/upload", b"dll", path="prefix/drive_c", name="mod.dll")
+        self.assertEqual((status, body), (201, {"path": "prefix/drive_c/mod.dll", "size": 3}))
+        status, body = self.fs("PUT", "/upload", b"dll2", path="prefix/drive_c", name="mod.dll")
+        self.assertEqual((status, body["error"]), (409, "exists"))
+        status, _ = self.fs("PUT", "/upload", b"dll2", path="prefix/drive_c", name="mod.dll", overwrite="1")
+        self.assertEqual(status, 201)
+        self.assertEqual((self.root / "drives/main/prefix/drive_c/mod.dll").read_bytes(), b"dll2")
+        for name in ("a/b.dll", "..", ".upload-x.part"):
+            status, body = self.fs("PUT", "/upload", b"x", path="prefix/drive_c", name=name)
+            self.assertEqual((status, body["error"]), (400, "invalid_name"), name)
+        for path in ("", "prefix", "files"):
+            status, body = self.fs("DELETE", "", path=path)
+            self.assertEqual((status, body["error"]), (400, "protected"), path)
+        status, _ = self.fs("DELETE", "", path="prefix/drive_c/mod.dll")
+        self.assertEqual(status, 204)
+        status, body = self.fs("PUT", "/upload", b"x", path="", name="stray.txt")
+        self.assertEqual((status, body["error"]), (400, "invalid_path"))
+
+
     def test_status(self):
         status, body = self.request("GET", "/api/status")
         self.assertEqual(status, 200)
@@ -281,8 +423,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.files_dir().iterdir() if "fake" in p.name or p.name.endswith(".part")], [])
 
     def test_upload_invalid_name(self):
-        status, body = self.request("PUT", "/api/drives/main/files/..%2Fx.exe", b"MZ")
-        self.assertEqual((status, body["error"]), (400, "invalid_name"))
+        for name in ("..%2Fx.exe", "readme.txt", "Game%2F.DS_Store"):
+            status, body = self.request("PUT", f"/api/drives/main/files/{name}", b"MZ")
+            self.assertEqual((status, body["error"]), (400, "invalid_name"), name)
 
     def test_upload_duplicate_and_overwrite(self):
         path = "/api/drives/main/files/Setup%20(x64).exe"
@@ -326,14 +469,10 @@ class ApiTests(unittest.TestCase):
         self.assertIn({"name": "Tool", "path": rel}, self.drive("main")["programs"])
         status, body = self.request("POST", "/api/drives/main/run", {"program": rel})
         self.assertEqual(status, 201)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            _, log = self.request("GET", f"/api/runs/{body['id']}/log")
-            if log:
-                break
-            time.sleep(0.05)
         # The fake runner echoes its argv; args were split Windows-style.
-        self.assertEqual(log.strip(), rb"ran C:\Games\Tool\tool.exe -w two words")
+        cwd = (prefix / "drive_c/Games/Tool").resolve()
+        self.assertEqual(self.wait_log(body["id"]).strip(),
+                         f"ran C:\\Games\\Tool\\tool.exe -w two words in {cwd}".encode())
 
     def test_run_rejects_traversal_program(self):
         status, body = self.request("POST", "/api/drives/main/run", {"program": "../../etc/passwd.lnk"})

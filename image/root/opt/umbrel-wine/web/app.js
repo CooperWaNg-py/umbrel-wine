@@ -45,11 +45,11 @@ async function api(method, url, body) {
     opts.body = JSON.stringify(body);
   }
   const res = await fetch(url, opts);
+  // Always read the body, even for 204: an unread response shows up in
+  // DevTools as a failed (ERR_ABORTED) request.
+  const text = await res.text();
   let data = null;
-  if (res.status !== 204) {
-    const text = await res.text();
-    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  }
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   return { ok: res.ok, status: res.status, data };
 }
 
@@ -114,17 +114,33 @@ function renderDriveBar() {
 
 function renderFiles(d) {
   const ready = d.state === "ready";
-  const list = $("files");
-  if (!d.files.length) {
-    list.replaceChildren(el("li", { class: "empty" }, "Upload a .exe to run it on this drive."));
-    return;
+  const rows = [];
+  for (const f of d.files) {
+    rows.push(el("li", {},
+      el("span", { class: "name", title: f.name, textContent: f.name }),
+      el("span", { class: "size", textContent: humanSize(f.size) }),
+      el("button", { class: "primary", textContent: "Run", disabled: !ready, onclick: () => run({ file: f.name }) }),
+      el("button", { class: "danger", textContent: "Delete", onclick: () => deleteFile(f.name, false) }),
+    ));
   }
-  list.replaceChildren(...d.files.map((f) => el("li", {},
-    el("span", { class: "name", title: f.name, textContent: f.name }),
-    el("span", { class: "size", textContent: humanSize(f.size) }),
-    el("button", { class: "primary", textContent: "Run", disabled: !ready, onclick: () => run({ file: f.name }) }),
-    el("button", { class: "danger", textContent: "Delete", onclick: () => deleteFile(f.name) }),
-  )));
+  // Folders list the .exe files inside; each runs in its own directory.
+  for (const f of d.folders) {
+    rows.push(el("li", { class: "folder" },
+      el("span", { class: "name", title: f.name, textContent: `📁 ${f.name}` }),
+      el("span", { class: "size", textContent: `${f.file_count} files · ${humanSize(f.size)}` }),
+      el("button", { textContent: "Browse", onclick: () => openBrowser(`files/${f.name}`) }),
+      el("button", { class: "danger", textContent: "Delete", onclick: () => deleteFile(f.name, true) }),
+    ));
+    if (!f.executables.length) rows.push(el("li", { class: "sub empty" }, "No .exe in this folder."));
+    for (const exe of f.executables) {
+      rows.push(el("li", { class: "sub" },
+        el("span", { class: "name", title: exe, textContent: exe.slice(f.name.length + 1) }),
+        el("button", { class: "primary", textContent: "Run", disabled: !ready, onclick: () => run({ file: exe }) }),
+      ));
+    }
+  }
+  if (!rows.length) rows.push(el("li", { class: "empty" }, "Upload a .exe, or a folder with a program and its files."));
+  $("files").replaceChildren(...rows);
 }
 
 function renderPrograms(d) {
@@ -231,9 +247,10 @@ async function run(body) {
   await refresh();
 }
 
-async function deleteFile(name) {
-  if (!confirm(`Delete ${name} from this drive?`)) return;
-  const r = await api("DELETE", driveUrl(current, `/files/${encodeURIComponent(name)}`));
+async function deleteFile(name, isFolder) {
+  const question = isFolder ? `Delete folder ${name} and everything in it?` : `Delete ${name} from this drive?`;
+  if (!confirm(question)) return;
+  const r = await api("DELETE", filesUrl(current, name));
   if (!r.ok) alert(errorMessage(r));
   await refresh();
 }
@@ -292,6 +309,11 @@ $("log-dialog").addEventListener("close", () => {
 });
 
 // ---------------------------------------------------------------- upload
+// A job is one loose .exe ({kind: "file", file}) or one folder ({kind:
+// "folder", name, entries: [{rel, file}]}) whose files keep their paths
+// below the drive's files/ ("Game/bin/game.exe").
+
+const FOLDER_PARALLEL = 3;
 
 function showUploadError(msg) {
   const box = $("upload-error");
@@ -299,18 +321,15 @@ function showUploadError(msg) {
   box.hidden = !msg;
 }
 
-function putFile(drive, file, overwrite) {
+function filesUrl(drive, rel, overwrite = false) {
+  return driveUrl(drive, `/files/${encodeURIComponent(rel)}`) + (overwrite ? "?overwrite=1" : "");
+}
+
+function xhrPut(url, file, onProgress) {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
-    const url = driveUrl(drive, `/files/${encodeURIComponent(file.name)}`) + (overwrite ? "?overwrite=1" : "");
     xhr.open("PUT", url);
-    xhr.upload.onprogress = (e) => {
-      if (!e.lengthComputable) return;
-      const pct = Math.floor((e.loaded / e.total) * 100);
-      $("upload-progress").value = pct;
-      $("upload-text").textContent =
-        `${pct}% · ${(e.loaded / 1048576).toFixed(1)} / ${(e.total / 1048576).toFixed(1)} MB`;
-    };
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded); };
     xhr.onload = () => {
       let data = null;
       try { data = JSON.parse(xhr.responseText); } catch { /* empty */ }
@@ -321,18 +340,55 @@ function putFile(drive, file, overwrite) {
   });
 }
 
-async function uploadOne(drive, file) {
+function showProgress(label, loaded, total) {
+  const pct = total ? Math.min(100, Math.floor((loaded / total) * 100)) : 100;
   $("upload").hidden = false;
-  $("upload-name").textContent = `${file.name} → ${drive}`;
-  $("upload-progress").value = 0;
-  $("upload-text").textContent = "";
-  let r = await putFile(drive, file, false);
-  if (r.status === 409 && confirm(`${file.name} already exists on this drive. Replace it?`)) {
-    r = await putFile(drive, file, true);
-  } else if (r.status === 409) {
-    return;
+  $("upload-name").textContent = label;
+  $("upload-progress").value = pct;
+  $("upload-text").textContent =
+    `${pct}% · ${(loaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`;
+}
+
+async function uploadLoose(drive, file) {
+  const progress = (n) => showProgress(`${file.name} → ${drive}`, n, file.size);
+  progress(0);
+  let r = await xhrPut(filesUrl(drive, file.name), file, progress);
+  if (r.status === 409) {
+    if (!confirm(`${file.name} already exists on this drive. Replace it?`)) return;
+    r = await xhrPut(filesUrl(drive, file.name, true), file, progress);
   }
   if (!r.ok) showUploadError(errorMessage(r));
+}
+
+async function uploadFolder(drive, name, entries) {
+  const d = drives.find((x) => x.name === drive);
+  if (d && d.folders.some((f) => f.name === name)) {
+    if (!confirm(`Folder ${name} already exists on this drive. Replace it? The existing folder is deleted first.`)) return;
+    const r = await api("DELETE", filesUrl(drive, name));
+    if (!r.ok && r.status !== 404) { showUploadError(errorMessage(r)); return; }
+  }
+  const total = entries.reduce((sum, e) => sum + e.file.size, 0);
+  const label = `${name}/ (${entries.length} files) → ${drive}`;
+  const inflight = new Map();
+  let doneBytes = 0;
+  let next = 0;
+  let failed = null;
+  const report = () => showProgress(label, doneBytes + [...inflight.values()].reduce((a, b) => a + b, 0), total);
+  // A few requests at once: folders are often thousands of small files.
+  async function worker() {
+    while (!failed && next < entries.length) {
+      const { rel, file } = entries[next++];
+      inflight.set(rel, 0);
+      const r = await xhrPut(filesUrl(drive, rel), file, (n) => { inflight.set(rel, n); report(); });
+      inflight.delete(rel);
+      if (!r.ok) { failed = failed || `${rel}: ${errorMessage(r)}`; return; }
+      doneBytes += file.size;
+      report();
+    }
+  }
+  report();
+  await Promise.all(Array.from({ length: Math.min(FOLDER_PARALLEL, entries.length) }, worker));
+  if (failed) showUploadError(`Upload of folder ${name} stopped. ${failed}`);
 }
 
 async function drainUploads() {
@@ -340,8 +396,9 @@ async function drainUploads() {
   uploading = true;
   try {
     while (uploadQueue.length) {
-      const { drive, file } = uploadQueue.shift();
-      await uploadOne(drive, file);
+      const job = uploadQueue.shift();
+      if (job.kind === "file") await uploadLoose(job.drive, job.file);
+      else await uploadFolder(job.drive, job.name, job.entries);
       await refresh();
     }
   } finally {
@@ -350,25 +407,284 @@ async function drainUploads() {
   }
 }
 
-function enqueueFiles(fileList) {
-  showUploadError("");
-  for (const file of fileList) uploadQueue.push({ drive: current, file });
+// Hidden files (.DS_Store, .git, ...) are skipped; the server refuses them.
+const isHidden = (rel) => rel.split("/").some((p) => p.startsWith("."));
+
+function looseJobs(files) {
+  const jobs = [];
+  const rejected = [];
+  for (const file of files) {
+    if (/\.exe$/i.test(file.name)) jobs.push({ kind: "file", file });
+    else rejected.push(file.name);
+  }
+  if (rejected.length) {
+    showUploadError(`Only .exe files can be uploaded on their own (${rejected.join(", ")}). ` +
+      "To include other files, upload the folder that contains them.");
+  }
+  return jobs;
+}
+
+function folderJobs(entries) {
+  const byFolder = new Map();
+  for (const e of entries) {
+    if (isHidden(e.rel)) continue;
+    const top = e.rel.split("/")[0];
+    if (!byFolder.has(top)) byFolder.set(top, []);
+    byFolder.get(top).push(e);
+  }
+  return [...byFolder].map(([name, list]) => ({ kind: "folder", name, entries: list }));
+}
+
+function enqueue(jobs) {
+  for (const job of jobs) uploadQueue.push({ drive: current, ...job });
   drainUploads();
 }
 
 $("file-input").addEventListener("change", (e) => {
-  enqueueFiles([...e.target.files]);
+  showUploadError("");
+  enqueue(looseJobs([...e.target.files]));
   e.target.value = "";
 });
+
+$("folder-input").addEventListener("change", (e) => {
+  showUploadError("");
+  const entries = [...e.target.files].map((file) => ({ rel: file.webkitRelativePath, file }));
+  const jobs = folderJobs(entries);
+  if (!jobs.length) showUploadError("That folder has no files to upload.");
+  enqueue(jobs);
+  e.target.value = "";
+});
+
+function readAllEntries(reader) {
+  // readEntries returns batches (about 100 in Chrome) until an empty one.
+  return new Promise((resolve, reject) => {
+    const out = [];
+    const step = () => reader.readEntries((batch) => {
+      if (!batch.length) resolve(out);
+      else { out.push(...batch); step(); }
+    }, reject);
+    step();
+  });
+}
+
+const entryFile = (entry) => new Promise((resolve, reject) => entry.file(resolve, reject));
+
+async function walkEntry(entry, prefix, out) {
+  if (entry.name.startsWith(".")) return;
+  const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+  if (entry.isFile) out.push({ rel, file: await entryFile(entry) });
+  else if (entry.isDirectory) {
+    for (const child of await readAllEntries(entry.createReader())) await walkEntry(child, rel, out);
+  }
+}
 
 const dz = $("dropzone");
 dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("over"); });
 dz.addEventListener("dragleave", () => dz.classList.remove("over"));
-dz.addEventListener("drop", (e) => {
+dz.addEventListener("drop", async (e) => {
   e.preventDefault();
   dz.classList.remove("over");
-  enqueueFiles([...e.dataTransfer.files]);
+  showUploadError("");
+  // Entries must be taken synchronously; the DataTransfer empties after await.
+  const items = [...e.dataTransfer.items]
+    .map((item) => (item.webkitGetAsEntry ? item.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  if (!items.length) { enqueue(looseJobs([...e.dataTransfer.files])); return; }
+  const loose = [];
+  const entries = [];
+  try {
+    for (const item of items) {
+      if (item.isDirectory) await walkEntry(item, "", entries);
+      else if (item.isFile) loose.push(await entryFile(item));
+    }
+  } catch (err) {
+    showUploadError(`Could not read the dropped files: ${err.message || err}`);
+    return;
+  }
+  const folders = folderJobs(entries);
+  if (items.some((i) => i.isDirectory) && !folders.length) showUploadError("The dropped folder has no files to upload.");
+  enqueue([...looseJobs(loose), ...folders]);
 });
+
+// ---------------------------------------------------------------- file browser
+// Browses the drive's own directory: files/ (uploads) and prefix/ (the Wine
+// prefix: drive_c, registry files). Paths are relative to the drive.
+
+const browse = { drive: null, path: "", doc: null, dirty: false };
+const PROTECTED = new Set(["files", "prefix"]);
+const HINTS = {
+  "": "files holds your uploads. prefix is the Wine environment: prefix/drive_c is the C: drive, and system.reg / user.reg are the registry.",
+  "prefix": "drive_c is this drive's C: drive. system.reg, user.reg and userdef.reg are the registry (Wine's regedit edits them too).",
+};
+const ENCODINGS = {
+  "utf-8": "UTF-8", "utf-8-bom": "UTF-8 with BOM", "utf-16-le": "UTF-16 LE",
+  "utf-16-be": "UTF-16 BE", "cp1252": "Windows-1252", "latin-1": "Latin-1",
+};
+
+function fsUrl(drive, endpoint, params = {}) {
+  return driveUrl(drive, `/fs${endpoint}?${new URLSearchParams(params)}`);
+}
+
+const joinPath = (dir, name) => (dir ? `${dir}/${name}` : name);
+
+function setBrowseStatus(msg, isError = false) {
+  const s = $("browse-status");
+  s.textContent = msg;
+  s.className = isError ? "error" : "muted";
+}
+
+async function openBrowser(path = "") {
+  browse.drive = current;
+  setBrowseStatus("");
+  $("browse-dialog").showModal();
+  await browseTo(path);
+}
+
+async function browseTo(path) {
+  const r = await api("GET", fsUrl(browse.drive, "/list", { path }));
+  if (!r.ok) {
+    setBrowseStatus(errorMessage(r), true);
+    if (path) return browseTo(""); // e.g. the folder was deleted meanwhile
+    return;
+  }
+  browse.path = r.data.path;
+  showEditor(false);
+  renderCrumbs();
+  renderEntries(r.data);
+}
+
+function renderCrumbs() {
+  $("browse-title").textContent = `Files on drive ${browse.drive}`;
+  const parts = browse.path ? browse.path.split("/") : [];
+  const crumbs = [el("button", { class: "crumb", textContent: browse.drive, onclick: () => browseTo("") })];
+  parts.forEach((p, i) => {
+    crumbs.push(el("span", { class: "sep", textContent: "/" }),
+      el("button", { class: "crumb", textContent: p, onclick: () => browseTo(parts.slice(0, i + 1).join("/")) }));
+  });
+  $("browse-crumbs").replaceChildren(...crumbs);
+  $("browse-upload").hidden = !browse.path;
+}
+
+function renderEntries(listing) {
+  const hint = HINTS[browse.path];
+  $("browse-hint").textContent = hint || "";
+  $("browse-hint").hidden = !hint;
+  const rows = listing.entries.map((e) => {
+    const path = joinPath(browse.path, e.name);
+    let name;
+    if (e.type === "dir") {
+      name = el("button", { class: "link", title: path, textContent: `📁 ${e.name}`, onclick: () => browseTo(path) });
+    } else if (e.type === "file") {
+      name = el("button", { class: "link", title: `Open ${path}`, textContent: `📄 ${e.name}`, onclick: () => openFile(path) });
+    } else {
+      name = el("span", { class: "muted", title: "Points outside this drive", textContent: `🔗 ${e.name}` });
+    }
+    return el("li", {},
+      el("span", { class: "name" }, name),
+      el("span", { class: "size", textContent: e.type === "file" ? humanSize(e.size) : "" }),
+      e.type === "file" ? el("button", { textContent: "Download", onclick: () => download(path) }) : "",
+      PROTECTED.has(path) ? "" : el("button", {
+        class: "danger", textContent: "Delete",
+        onclick: () => fsDelete(path, e.type === "dir" && !e.link),
+      }),
+    );
+  });
+  if (!rows.length) rows.push(el("li", { class: "empty" }, "This folder is empty."));
+  if (listing.truncated) rows.push(el("li", { class: "empty" }, "Only the first 5000 entries are shown."));
+  $("browse-list").replaceChildren(...rows);
+}
+
+function download(path) {
+  const a = el("a", { href: fsUrl(browse.drive, "/download", { path }), download: "" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+async function fsDelete(path, isDir) {
+  if (!confirm(`Delete ${path}${isDir ? " and everything in it" : ""}?`)) return;
+  const r = await api("DELETE", fsUrl(browse.drive, "", { path }));
+  if (!r.ok) { setBrowseStatus(errorMessage(r), true); return; }
+  await browseTo(browse.path);
+  setBrowseStatus(`Deleted ${path}.`);
+  if (path.startsWith("files/")) refresh();
+}
+
+async function openFile(path) {
+  const r = await api("GET", fsUrl(browse.drive, "/text", { path }));
+  if (r.status === 413 || r.status === 415) {
+    if (confirm(`${errorMessage(r)}\n\nDownload ${path}?`)) download(path);
+    return;
+  }
+  if (!r.ok) { setBrowseStatus(errorMessage(r), true); return; }
+  showEditor(true);
+  browse.doc = r.data;
+  browse.dirty = false;
+  $("editor-path").textContent = path;
+  $("editor-meta").textContent =
+    `${ENCODINGS[r.data.encoding] || r.data.encoding} · ${r.data.newline === "\r\n" ? "CRLF" : "LF"} · ${humanSize(r.data.size)}`;
+  $("editor-note").hidden = !/\.reg$/i.test(path);
+  $("editor-text").value = r.data.text;
+  $("editor-text").focus();
+  setBrowseStatus("");
+}
+
+function showEditor(on) {
+  $("browse-list-view").hidden = on;
+  $("browse-editor").hidden = !on;
+  if (!on) { browse.doc = null; browse.dirty = false; }
+}
+
+const discardOk = () => !browse.dirty || confirm("Discard your unsaved changes?");
+
+$("editor-text").addEventListener("input", () => { browse.dirty = true; });
+
+$("editor-save").addEventListener("click", async () => {
+  const doc = browse.doc;
+  if (!doc) return;
+  const r = await api("PUT", fsUrl(browse.drive, "/text"), {
+    path: doc.path, text: $("editor-text").value, encoding: doc.encoding, newline: doc.newline, mtime_ns: doc.mtime_ns,
+  });
+  if (!r.ok) { setBrowseStatus(errorMessage(r), true); return; }
+  doc.mtime_ns = r.data.mtime_ns;
+  browse.dirty = false;
+  setBrowseStatus(`Saved ${doc.path}.`);
+  if (doc.path.startsWith("files/")) refresh();
+});
+
+$("editor-close").addEventListener("click", async () => {
+  if (discardOk()) await browseTo(browse.path);
+});
+
+$("browse-upload-input").addEventListener("change", async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  const dir = browse.path;
+  for (const file of files) {
+    const url = (overwrite) => fsUrl(browse.drive, "/upload",
+      overwrite ? { path: dir, name: file.name, overwrite: "1" } : { path: dir, name: file.name });
+    const progress = (n) => setBrowseStatus(`Uploading ${file.name}: ${Math.floor((n / Math.max(file.size, 1)) * 100)}%`);
+    let r = await xhrPut(url(false), file, progress);
+    if (r.status === 409) {
+      if (!confirm(`${file.name} already exists in this folder. Replace it?`)) continue;
+      r = await xhrPut(url(true), file, progress);
+    }
+    if (!r.ok) { setBrowseStatus(errorMessage(r), true); break; }
+    setBrowseStatus(`Uploaded ${file.name}.`);
+  }
+  if (browse.path === dir) {
+    const status = $("browse-status").textContent;
+    const isError = $("browse-status").className === "error";
+    await browseTo(dir);
+    setBrowseStatus(status, isError);
+  }
+  if (dir.startsWith("files")) refresh();
+});
+
+$("drive-browse").addEventListener("click", () => openBrowser(""));
+$("browse-close").addEventListener("click", () => { if (discardOk()) $("browse-dialog").close(); });
+$("browse-dialog").addEventListener("cancel", (e) => { if (!discardOk()) e.preventDefault(); });
+$("browse-dialog").addEventListener("close", () => showEditor(false));
 
 // ---------------------------------------------------------------- sidebar
 

@@ -6,7 +6,7 @@ version: "3.7"
 # The image is published as a multi-arch manifest list (linux/amd64 + linux/arm64)
 # by .github/workflows/publish-image.yml. Pin the INDEX digest here -- not a
 # per-platform digest, or one architecture will fail to pull:
-#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.1.0
+#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.2.0
 
 services:
   # Required stub: umbrelOS only merges its app_proxy fragment if the service is

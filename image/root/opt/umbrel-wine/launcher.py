@@ -4,7 +4,7 @@ A drive is one Wine prefix (its own C: drive and registry) plus the .exe files
 uploaded to it:
 
     <root>/drives/<drive>/prefix/   WINEPREFIX
-    <root>/drives/<drive>/files/    uploaded .exe files
+    <root>/drives/<drive>/files/    uploaded .exe files and folders
     <root>/logs/<drive>-<YYYYmmdd-HHMMSS>-<stem>.log
 
 Python 3 stdlib only. Importing this module has no side effects; only main()
@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -28,10 +29,22 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 DRIVE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,199}\.[Ee][Xx][Ee]$")
+# Uploaded paths are relative to a drive's files/ directory: either one .exe
+# ("putty.exe") or anything inside a folder ("Game/data/level1.pak"), so
+# programs that need DLLs or data files next to them can be uploaded whole.
+WINDOWS_ILLEGAL = frozenset('<>:"/\\|?*')
+MAX_PATH_CHARS = 1024
+MAX_PATH_DEPTH = 32
+MAX_COMPONENT_BYTES = 255
+# Executables listed per folder; installers and games can ship dozens of
+# helper .exe files (crash handlers, redistributables).
+MAX_LISTED_EXES = 100
+# Folder summaries walk the whole tree; programs may write into their folder,
+# so cached summaries expire even without an API write.
+FOLDER_CACHE_TTL = 30
 
 MAIN_DRIVE = "main"
 CHUNK = 1024 * 1024
@@ -39,6 +52,14 @@ UPLOAD_RESERVE = 512 * 1024 * 1024
 MAX_LOGS = 50
 LOG_TAIL = 64 * 1024
 MAX_JSON_BODY = 64 * 1024
+# Drive file browser: text files up to this size open in the editor. The save
+# body is JSON, where escaping can grow the text several times over.
+MAX_EDIT_BYTES = 2 * 1024 * 1024
+MAX_TEXT_BODY = 16 * 1024 * 1024
+MAX_LIST_ENTRIES = 5000
+# Browser paths are relative to drives/<d>/; these hold the drive together and
+# are removed only through Reset / Delete drive.
+PROTECTED_BROWSE_PATHS = frozenset({"", "files", "prefix"})
 KILL_TIMEOUT = 10
 STOP_GRACE = 5
 # Upper bound on draining a rejected upload's body; see Handler._linger.
@@ -90,12 +111,134 @@ def validate_drive_name(s: str) -> bool:
     return isinstance(s, str) and DRIVE_NAME_RE.match(s) is not None
 
 
-def validate_upload_name(s: str) -> bool:
-    return (
-        isinstance(s, str)
-        and s == os.path.basename(s)
-        and UPLOAD_NAME_RE.match(s) is not None
-    )
+def split_rel_path(s) -> list[str] | None:
+    """Components of a safe path relative to files/, or None.
+
+    Rejects empty, `.`/`..` and dot-prefixed components (also keeps clear of
+    the launcher's own .upload-*.part files), characters Windows cannot put in
+    a file name, and trailing dots/spaces, which Windows strips.
+    """
+    if not isinstance(s, str) or not s or len(s) > MAX_PATH_CHARS:
+        return None
+    parts = s.split("/")
+    if len(parts) > MAX_PATH_DEPTH:
+        return None
+    for p in parts:
+        if (
+            not p
+            or p.startswith(".")
+            or p.endswith((" ", "."))
+            or len(p.encode("utf-8", errors="replace")) > MAX_COMPONENT_BYTES
+            or any(c in WINDOWS_ILLEGAL or ord(c) < 32 for c in p)
+        ):
+            return None
+    return parts
+
+
+def is_exe(name: str) -> bool:
+    return name.lower().endswith(".exe")
+
+
+def validate_upload_path(s) -> list[str] | None:
+    """split_rel_path, plus: a file on its own (not in a folder) must be .exe."""
+    parts = split_rel_path(s)
+    if parts is None or (len(parts) == 1 and not is_exe(parts[0])):
+        return None
+    return parts
+
+
+def contained(root: Path, path: Path) -> bool:
+    """Whether `path` resolves inside `root`. Programs run as the same user and
+    could plant symlinks in files/; API writes and deletes must not follow
+    them out."""
+    r = root.resolve()
+    p = path.resolve()
+    return p == r or p.is_relative_to(r)
+
+
+def summarize_folder(files: Path, name: str) -> dict:
+    """Size, file count and .exe paths (relative to files/) of one folder."""
+    size = count = 0
+    exes = []
+    for dirpath, dirnames, filenames in os.walk(files / name):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for f in filenames:
+            if f.startswith("."):
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            size += st.st_size
+            count += 1
+            if is_exe(f):
+                exes.append(Path(dirpath, f).relative_to(files).as_posix())
+    exes.sort(key=lambda r: (r.count("/"), r.casefold()))
+    return {"size": size, "file_count": count, "executables": exes[:MAX_LISTED_EXES]}
+
+
+def split_browse_path(s) -> list[str] | None:
+    """Components of a file-browser path relative to drives/<d>/, or None.
+
+    More permissive than upload paths: internal files include dotfiles and
+    names like dosdevices/c:. Only empty, `.` and `..` components are refused;
+    symlinks are handled by `contained`.
+    """
+    if s is None or s == "":
+        return []
+    if not isinstance(s, str) or len(s) > 4096 or "\0" in s:
+        return None
+    parts = s.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    return parts
+
+
+# name -> (BOM, codec). Detection order matters: BOMs first, then strict UTF-8,
+# then cp1252 (Windows' ANSI page), then latin-1, which decodes any byte.
+TEXT_ENCODINGS = {
+    "utf-8-bom": (b"\xef\xbb\xbf", "utf-8"),
+    "utf-16-le": (b"\xff\xfe", "utf-16-le"),
+    "utf-16-be": (b"\xfe\xff", "utf-16-be"),
+    "utf-8": (b"", "utf-8"),
+    "cp1252": (b"", "cp1252"),
+    "latin-1": (b"", "latin-1"),
+}
+
+
+def decode_text(data: bytes) -> dict | None:
+    """{"text", "encoding", "newline"} for an editable text file, or None if it
+    looks binary. Text is returned with \\n line endings; `newline` records the
+    file's own so encode_text can restore it (textareas normalise to \\n)."""
+    for name, (bom, codec) in TEXT_ENCODINGS.items():
+        if bom and data.startswith(bom):
+            try:
+                text = data[len(bom):].decode(codec)
+            except UnicodeDecodeError:
+                return None
+            break
+    else:
+        if b"\0" in data:
+            return None
+        for name in ("utf-8", "cp1252", "latin-1"):
+            try:
+                text = data.decode(TEXT_ENCODINGS[name][1])
+                break
+            except UnicodeDecodeError:
+                continue
+    newline = "\r\n" if "\r\n" in text else "\n"
+    return {"text": text.replace("\r\n", "\n"), "encoding": name, "newline": newline}
+
+
+def encode_text(text: str, encoding: str, newline: str) -> bytes:
+    """Inverse of decode_text. Raises ValueError for an unknown encoding or
+    newline and UnicodeEncodeError for characters the encoding cannot hold."""
+    if encoding not in TEXT_ENCODINGS or newline not in ("\n", "\r\n"):
+        raise ValueError("unknown encoding or newline")
+    bom, codec = TEXT_ENCODINGS[encoding]
+    return bom + text.replace("\r\n", "\n").replace("\n", newline).encode(codec)
 
 
 def scan_programs(prefix: Path) -> list[dict]:
@@ -661,6 +804,8 @@ class App:
         self.arch = os.uname().machine
         self.page_size = os.sysconf("SC_PAGE_SIZE")
         self.wine_version: str | None = None
+        self._folder_lock = threading.Lock()
+        self._folder_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 
     def start(self) -> None:
         self.cfg.logs.mkdir(parents=True, exist_ok=True)
@@ -694,21 +839,46 @@ class App:
             "warnings": warnings,
         }
 
-    def list_files(self, drive: str) -> list[dict]:
-        out = []
+    def folder_summary(self, drive: str, name: str) -> dict:
+        key = (drive, name)
+        now = time.monotonic()
+        with self._folder_lock:
+            hit = self._folder_cache.get(key)
+        if hit and now - hit[0] < FOLDER_CACHE_TTL:
+            return hit[1]
+        summary = summarize_folder(self.drives.files_dir(drive), name)
+        with self._folder_lock:
+            self._folder_cache[key] = (now, summary)
+        return summary
+
+    def invalidate_folder(self, drive: str, name: str | None = None) -> None:
+        """Drop cached summaries for one folder, or all of a drive's."""
+        with self._folder_lock:
+            for key in [k for k in self._folder_cache if k[0] == drive and name in (None, k[1])]:
+                del self._folder_cache[key]
+
+    def list_files(self, drive: str) -> tuple[list[dict], list[dict]]:
+        """Top-level .exe files and folders in the drive's files/ directory.
+
+        Only names the API can run/delete are listed; this hides .upload-*.part
+        files and anything a program wrote next to a loose .exe.
+        """
+        files, folders = [], []
         try:
             entries = list(self.drives.files_dir(drive).iterdir())
         except FileNotFoundError:
-            return out
+            return files, folders
         for p in entries:
-            # Only names the API can run/delete; hides .upload-*.part files and
-            # anything a program wrote next to its .exe.
-            if not validate_upload_name(p.name) or not p.is_file():
+            if split_rel_path(p.name) is None or p.is_symlink():
                 continue
-            st = p.stat()
-            out.append({"name": p.name, "size": st.st_size, "mtime": int(st.st_mtime)})
-        out.sort(key=lambda f: f["name"].casefold())
-        return out
+            if p.is_dir():
+                folders.append({"name": p.name, **self.folder_summary(drive, p.name)})
+            elif p.is_file() and is_exe(p.name):
+                st = p.stat()
+                files.append({"name": p.name, "size": st.st_size, "mtime": int(st.st_mtime)})
+        files.sort(key=lambda f: f["name"].casefold())
+        folders.sort(key=lambda f: f["name"].casefold())
+        return files, folders
 
     def list_drives(self) -> list[dict]:
         result = []
@@ -717,11 +887,13 @@ class App:
                 info = self.drives.info(name)
             except ApiError:
                 continue  # deleted between names() and info()
+            files, folders = self.list_files(name)
             result.append({
                 "name": name,
                 "state": info["state"],
                 "error_message": info["error_message"],
-                "files": self.list_files(name),
+                "files": files,
+                "folders": folders,
                 "programs": scan_programs(self.drives.prefix(name)),
                 "runs": self.runs.for_drive(name),
             })
@@ -730,6 +902,7 @@ class App:
     def delete_drive(self, name: str) -> tuple[int, None]:
         result = self.drives.delete(name)
         self.runs.forget_drive(name)
+        self.invalidate_folder(name)
         return result
 
     def run(self, drive: str, body) -> tuple[int, dict]:
@@ -739,14 +912,17 @@ class App:
         if not isinstance(body, dict):
             raise ApiError(400, "bad_request", "Expected a JSON object.")
         if "file" in body:
+            # A loose .exe or one inside an uploaded folder. The program runs
+            # in its own directory so it finds the DLLs and data next to it.
             name = body["file"]
-            if not validate_upload_name(name):
+            parts = split_rel_path(name)
+            if parts is None or not is_exe(parts[-1]):
                 raise ApiError(400, "invalid_name", "Invalid file name.")
             files = self.drives.files_dir(drive)
-            path = files / name
-            if not path.is_file():
+            path = files.joinpath(*parts)
+            if not path.is_file() or not contained(files, path):
                 raise ApiError(404, "no_such_file", f"No file named {name!r} on this drive.")
-            run = self.runs.start(drive, [str(path)], cwd=files, label=name)
+            run = self.runs.start(drive, [str(path)], cwd=path.parent, label=name)
         elif "program" in body:
             lnk = resolve_program(self.drives.prefix(drive), body["program"])
             if lnk is None:
@@ -756,6 +932,139 @@ class App:
         else:
             raise ApiError(400, "bad_request", 'Expected "file" or "program".')
         return 201, {"id": run.id}
+
+    # -- drive file browser ------------------------------------------------
+
+    def _fs_path(self, drive: str, rel) -> tuple[Path, list[str], Path]:
+        """(drive root, components, path) for a browser path, or ApiError."""
+        self.drives.require(drive)
+        parts = split_browse_path(rel)
+        if parts is None:
+            raise ApiError(400, "invalid_path", "Invalid path.")
+        root = self.drives.drive_dir(drive)
+        return root, parts, root.joinpath(*parts)
+
+    def _fs_existing(self, drive: str, rel) -> tuple[Path, list[str], Path]:
+        """Like _fs_path, but the path must exist and resolve inside the drive
+        (dosdevices/c: -> ../drive_c is fine; dosdevices/z: -> / is not)."""
+        root, parts, path = self._fs_path(drive, rel)
+        if not path.exists() or not contained(root, path):
+            raise ApiError(404, "no_such_file", f"{'/'.join(parts) or 'The drive'} does not exist.")
+        return root, parts, path
+
+    def fs_changed(self, drive: str, parts: list[str]) -> None:
+        if len(parts) >= 2 and parts[0] == "files":
+            self.invalidate_folder(drive, parts[1])
+
+    def fs_list(self, drive: str, rel) -> dict:
+        root, parts, path = self._fs_existing(drive, rel)
+        if not path.is_dir():
+            raise ApiError(400, "not_a_directory", f"{'/'.join(parts)} is not a folder.")
+        entries = []
+        with os.scandir(path) as it:
+            for e in it:
+                entry = {"name": e.name, "link": e.is_symlink(), "size": None, "mtime": None}
+                try:
+                    if entry["link"] and not contained(root, Path(e.path)):
+                        entry["type"] = "link"  # points outside the drive; not followed
+                    elif e.is_dir():
+                        entry["type"] = "dir"
+                    elif e.is_file():
+                        entry["type"] = "file"
+                    else:
+                        entry["type"] = "other"
+                    if entry["type"] in ("dir", "file"):
+                        st = e.stat()
+                        entry["mtime"] = int(st.st_mtime)
+                        if entry["type"] == "file":
+                            entry["size"] = st.st_size
+                except OSError:
+                    entry["type"] = "other"
+                entries.append(entry)
+        entries.sort(key=lambda x: (x["type"] != "dir", x["name"].casefold()))
+        return {
+            "path": "/".join(parts),
+            "entries": entries[:MAX_LIST_ENTRIES],
+            "truncated": len(entries) > MAX_LIST_ENTRIES,
+        }
+
+    def fs_file(self, drive: str, rel) -> Path:
+        """Resolved path of an existing regular file inside the drive."""
+        _root, parts, path = self._fs_existing(drive, rel)
+        if not path.is_file():
+            raise ApiError(400, "not_a_file", f"{'/'.join(parts)} is not a file.")
+        return path.resolve()
+
+    def fs_read_text(self, drive: str, rel) -> dict:
+        path = self.fs_file(drive, rel)
+        st = path.stat()
+        if st.st_size > MAX_EDIT_BYTES:
+            raise ApiError(413, "too_large", "This file is too large to edit here (limit 2 MB); download it instead.")
+        decoded = decode_text(path.read_bytes())
+        if decoded is None:
+            raise ApiError(415, "not_text", "This file is not a text file; download it instead.")
+        # mtime_ns travels as a string: ~1.8e18 exceeds JavaScript's exact
+        # integer range, and a rounded value would make every save a conflict.
+        return {"path": rel, "mtime_ns": str(st.st_mtime_ns), "size": st.st_size, **decoded}
+
+    def fs_write_text(self, drive: str, body) -> dict:
+        if not isinstance(body, dict) or not all(
+            isinstance(body.get(k), t)
+            for k, t in (("path", str), ("text", str), ("encoding", str), ("newline", str), ("mtime_ns", str))
+        ):
+            raise ApiError(400, "bad_request", "Expected path, text, encoding, newline and mtime_ns.")
+        path = self.fs_file(drive, body["path"])
+        st = path.stat()
+        if str(st.st_mtime_ns) != body["mtime_ns"]:
+            raise ApiError(
+                409, "changed",
+                "The file changed on disk since you opened it. Wine rewrites registry and "
+                "settings files while programs run: stop the drive's programs, reopen the "
+                "file and apply your edit again.",
+            )
+        try:
+            data = encode_text(body["text"], body["encoding"], body["newline"])
+        except UnicodeEncodeError as e:
+            raise ApiError(400, "unencodable", f"{e.object[e.start]!r} cannot be saved in this file's encoding ({body['encoding']}).")
+        except ValueError:
+            raise ApiError(400, "bad_request", "Unknown encoding or line ending.")
+        # Atomic: write a sibling temp file, then rename over the original.
+        tmp = path.with_name(f".{path.name}.umbrel-wine-{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            tmp.write_bytes(data)
+            shutil.copymode(path, tmp)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        self.fs_changed(drive, split_browse_path(body["path"]))
+        st = path.stat()
+        return {"path": body["path"], "mtime_ns": str(st.st_mtime_ns), "size": st.st_size}
+
+    def fs_delete(self, drive: str, rel) -> None:
+        root, parts, path = self._fs_path(drive, rel)
+        if "/".join(parts) in PROTECTED_BROWSE_PATHS:
+            raise ApiError(400, "protected", "This folder holds the drive together; use Reset or Delete drive instead.")
+        # The entry itself may be a symlink pointing anywhere; only the link is
+        # removed, so only its parent has to be inside the drive.
+        if not (path.exists() or path.is_symlink()) or not contained(root, path.parent):
+            raise ApiError(404, "no_such_file", f"{'/'.join(parts)} does not exist.")
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        self.fs_changed(drive, parts)
+
+    def fs_upload_target(self, drive: str, rel_dir, name) -> tuple[list[str], Path]:
+        """Components and path for uploading `name` into folder `rel_dir`."""
+        root, parts, folder = self._fs_existing(drive, rel_dir)
+        name_parts = split_browse_path(name)
+        if not name_parts or len(name_parts) != 1 or name.startswith(".upload-"):
+            raise ApiError(400, "invalid_name", "Invalid file name.")
+        if not folder.is_dir():
+            raise ApiError(400, "not_a_directory", f"{'/'.join(parts)} is not a folder.")
+        if not parts:
+            raise ApiError(400, "invalid_path", "Upload into a folder inside files/ or prefix/.")
+        return parts + name_parts, folder.resolve() / name
 
 
 # --------------------------------------------------------------------------
@@ -770,7 +1079,14 @@ ROUTES = [
     (re.compile(r"^/api/drives/([^/]+)/reset$"), {"POST": "post_reset"}),
     (re.compile(r"^/api/drives/([^/]+)/stop-all$"), {"POST": "post_stop_all"}),
     (re.compile(r"^/api/drives/([^/]+)/run$"), {"POST": "post_run"}),
-    (re.compile(r"^/api/drives/([^/]+)/files/([^/]+)$"), {"PUT": "put_file", "DELETE": "delete_file"}),
+    # The file path may contain literal slashes or %2F (encodeURIComponent).
+    (re.compile(r"^/api/drives/([^/]+)/files/(.+)$"), {"PUT": "put_file", "DELETE": "delete_file"}),
+    # File browser: ?path= is relative to the drive (files/..., prefix/...).
+    (re.compile(r"^/api/drives/([^/]+)/fs$"), {"DELETE": "delete_fs"}),
+    (re.compile(r"^/api/drives/([^/]+)/fs/list$"), {"GET": "get_fs_list"}),
+    (re.compile(r"^/api/drives/([^/]+)/fs/text$"), {"GET": "get_fs_text", "PUT": "put_fs_text"}),
+    (re.compile(r"^/api/drives/([^/]+)/fs/download$"), {"GET": "get_fs_download"}),
+    (re.compile(r"^/api/drives/([^/]+)/fs/upload$"), {"PUT": "put_fs_upload"}),
     (re.compile(r"^/api/runs/([^/]+)/stop$"), {"POST": "post_run_stop"}),
     (re.compile(r"^/api/runs/([^/]+)/log$"), {"GET": "get_run_log"}),
 ]
@@ -826,7 +1142,7 @@ class Handler(BaseHTTPRequestHandler):
     def _send_api_error(self, e: ApiError, close=False):
         self._send_json(e.status, {"error": e.code, "message": e.message}, close=close)
 
-    def _read_json(self):
+    def _read_json(self, limit=MAX_JSON_BODY):
         length = self.headers.get("Content-Length")
         if length is None:
             return {}
@@ -834,7 +1150,7 @@ class Handler(BaseHTTPRequestHandler):
             n = int(length)
         except ValueError:
             raise ApiError(400, "bad_request", "Invalid Content-Length.")
-        if n < 0 or n > MAX_JSON_BODY:
+        if n < 0 or n > limit:
             self.close_connection = True
             raise ApiError(413, "too_large", "Request body too large.")
         raw = self.rfile.read(n) if n else b""
@@ -919,19 +1235,34 @@ class Handler(BaseHTTPRequestHandler):
         self._send_body(200, text, "text/plain; charset=utf-8", extra={"Cache-Control": "no-cache"})
 
     def delete_file(self, drive, name):
+        """Delete a loose .exe, a file inside a folder, or a whole folder."""
         self.app.drives.require(drive)
-        if not validate_upload_name(name):
+        parts = split_rel_path(name)
+        files = self.app.drives.files_dir(drive)
+        target = files.joinpath(*parts) if parts else None
+        if (
+            target is None
+            or not (target.exists() or target.is_symlink())
+            or not contained(files, target.parent)
+        ):
             raise ApiError(404, "no_such_file", f"No file named {name!r} on this drive.")
-        try:
-            (self.app.drives.files_dir(drive) / name).unlink()
-        except FileNotFoundError:
-            raise ApiError(404, "no_such_file", f"No file named {name!r} on this drive.")
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        self.app.invalidate_folder(drive, parts[0])
         self._send_json(204, None)
 
     def put_file(self, drive, name):
+        self._guarded_upload(self._receive_upload, drive, name)
+
+    def put_fs_upload(self, drive):
+        self._guarded_upload(self._receive_fs_upload, drive)
+
+    def _guarded_upload(self, receive, *args):
         self._upload_left = None  # body bytes still unread; None = unknown
         try:
-            self._receive_upload(drive, name)
+            receive(*args)
         except ApiError as e:
             self._send_api_error(e, close=True)
             self._linger(self._upload_left)
@@ -966,16 +1297,8 @@ class Handler(BaseHTTPRequestHandler):
             if left is not None:
                 left -= len(data)
 
-    def _receive_upload(self, drive, name):
-        # Every check runs before any of the body is read; on failure the
-        # connection is closed so the unread body is never parsed as a request.
-        self.close_connection = True
-        self.app.drives.require(drive)
-        if not validate_upload_name(name):
-            raise ApiError(
-                400, "invalid_name",
-                "File names must end in .exe and use letters, digits, spaces and ._()+-",
-            )
+    def _upload_length(self) -> int:
+        """Content-Length of an upload, checked against free space."""
         length = self.headers.get("Content-Length")
         if length is None:
             raise ApiError(411, "length_required", "Content-Length is required.")
@@ -989,16 +1312,15 @@ class Handler(BaseHTTPRequestHandler):
         free = shutil.disk_usage(self.app.cfg.root).free
         if total > free - UPLOAD_RESERVE:
             raise ApiError(507, "insufficient_storage", "Not enough free space on the Umbrel for this file.")
-        files = self.app.drives.files_dir(drive)
-        target = files / name
-        if target.exists() and self.query.get("overwrite", [""])[0] != "1":
-            raise ApiError(409, "exists", f"{name} already exists on this drive.")
+        return total
 
+    def _stream_upload(self, target: Path, part_dir: Path, name: str, total: int, check_mz: bool) -> bool:
+        """Stream the body to part_dir/.upload-*.part, then move it onto target
+        (creating missing parent folders). False if the client went away."""
         if self.headers.get("Expect", "").lower() == "100-continue":
             self.send_response_only(100)
             self.end_headers()
-
-        part = files / f".upload-{uuid.uuid4().hex}.part"
+        part = part_dir / f".upload-{uuid.uuid4().hex}.part"
         done = False
         try:
             with open(part, "wb") as f:
@@ -1008,24 +1330,109 @@ class Handler(BaseHTTPRequestHandler):
                     chunk = self.rfile.read(min(CHUNK, remaining)) if remaining > 0 else b""
                     if first:
                         first = False
-                        if chunk[:2] != b"MZ":
+                        if check_mz and chunk[:2] != b"MZ":
                             self._upload_left = remaining - len(chunk)
                             raise ApiError(
                                 415, "not_a_windows_executable",
                                 f"{name} is not a Windows executable.",
                             )
                     if remaining > 0 and not chunk:
-                        return  # client went away mid-upload; nothing to answer
+                        return False  # client went away mid-upload; nothing to answer
                     f.write(chunk)
                     remaining -= len(chunk)
                     self._upload_left = remaining
+            target.parent.mkdir(parents=True, exist_ok=True)
             os.replace(part, target)
             done = True
         finally:
             if not done:
                 part.unlink(missing_ok=True)
-        self.close_connection = False
-        self._send_json(201, {"name": name, "size": total})
+        return True
+
+    def _receive_upload(self, drive, name):
+        # Every check runs before any of the body is read; on failure the
+        # connection is closed so the unread body is never parsed as a request.
+        self.close_connection = True
+        self.app.drives.require(drive)
+        parts = validate_upload_path(name)
+        if parts is None:
+            raise ApiError(
+                400, "invalid_name",
+                "A file uploaded on its own must be a .exe; upload the folder that "
+                "contains it to include other files. Names cannot start with a dot "
+                'or contain <>:"\\|?*.',
+            )
+        total = self._upload_length()
+        files = self.app.drives.files_dir(drive)
+        target = files.joinpath(*parts)
+        # Every existing ancestor must be a real directory inside files/, and
+        # the target must not be one.
+        for i in range(1, len(parts)):
+            ancestor = files.joinpath(*parts[:i])
+            if ancestor.is_symlink() or (ancestor.exists() and not ancestor.is_dir()):
+                raise ApiError(409, "exists", f"{'/'.join(parts[:i])} already exists on this drive and is not a folder.")
+        if target.is_dir() or target.is_symlink():
+            raise ApiError(409, "exists", f"{name} already exists on this drive as a folder.")
+        if target.exists() and self._q("overwrite") != "1":
+            raise ApiError(409, "exists", f"{name} already exists on this drive.")
+        if self._stream_upload(target, files, name, total, check_mz=is_exe(parts[-1])):
+            self.app.invalidate_folder(drive, parts[0])
+            self.close_connection = False
+            self._send_json(201, {"name": name, "size": total})
+
+    def _receive_fs_upload(self, drive):
+        """File-browser upload: any file into an existing folder of the drive."""
+        self.close_connection = True
+        name = self._q("name")
+        parts, target = self.app.fs_upload_target(drive, self._q("path"), name)
+        total = self._upload_length()
+        rel = "/".join(parts)
+        if target.is_dir():
+            raise ApiError(409, "exists", f"{rel} already exists as a folder.")
+        if target.exists() and self._q("overwrite") != "1":
+            raise ApiError(409, "exists", f"{name} already exists in this folder.")
+        # The part file lives in files/ (same filesystem), where startup
+        # cleans up leftovers.
+        if self._stream_upload(target, self.app.drives.files_dir(drive), name, total, check_mz=False):
+            self.app.fs_changed(drive, parts)
+            self.close_connection = False
+            self._send_json(201, {"path": rel, "size": total})
+
+    # -- drive file browser ------------------------------------------------
+
+    def _q(self, key: str) -> str:
+        return self.query.get(key, [""])[0]
+
+    def get_fs_list(self, drive):
+        self._send_json(200, self.app.fs_list(drive, self._q("path")))
+
+    def get_fs_text(self, drive):
+        self._send_json(200, self.app.fs_read_text(drive, self._q("path")))
+
+    def put_fs_text(self, drive):
+        self._send_json(200, self.app.fs_write_text(drive, self._read_json(limit=MAX_TEXT_BODY)))
+
+    def delete_fs(self, drive):
+        self.app.fs_delete(drive, self._q("path"))
+        self._send_json(204, None)
+
+    def get_fs_download(self, drive):
+        path = self.app.fs_file(drive, self._q("path"))
+        with open(path, "rb") as f:
+            remaining = os.fstat(f.fileno()).st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(remaining))
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(path.name)}")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            while remaining > 0:
+                chunk = f.read(min(CHUNK, remaining))
+                if not chunk:
+                    self.close_connection = True  # file shrank; the length was a lie
+                    return
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
 
 def make_server(app: App) -> ThreadingHTTPServer:

@@ -33,15 +33,22 @@
             <button id="drive-reset">Reset</button>
             <button id="drive-delete" class="danger">Delete</button>
           </div>
+          <div class="row buttons">
+            <button id="drive-browse">Browse drive files</button>
+          </div>
           <div id="drive-note" class="note" hidden></div>
         </section>
 
         <section>
           <h2>Upload</h2>
-          <label id="dropzone">
-            <input id="file-input" type="file" accept=".exe" multiple>
-            <span>Drop <b>.exe</b> files here or click to choose</span>
-          </label>
+          <div id="dropzone">
+            <span>Drop <b>.exe</b> files or program folders here</span>
+            <div class="row buttons">
+              <label class="button">Choose .exe files<input id="file-input" type="file" accept=".exe" multiple hidden></label>
+              <label class="button">Choose folder<input id="folder-input" type="file" webkitdirectory multiple hidden></label>
+            </div>
+          </div>
+          <div class="muted hint">Upload the whole folder when a program needs DLLs or data files next to it.</div>
           <div id="upload" hidden>
             <div id="upload-name" class="ellipsis"></div>
             <progress id="upload-progress" max="100" value="0"></progress>
@@ -82,6 +89,34 @@
       <button id="log-close" class="icon" aria-label="Close">✕</button>
     </header>
     <pre id="log-text"></pre>
+  </dialog>
+
+  <dialog id="browse-dialog">
+    <header class="bar">
+      <h2 id="browse-title">Files</h2>
+      <button id="browse-close" class="icon" aria-label="Close">✕</button>
+    </header>
+    <div id="browse-list-view" class="dialog-body">
+      <div class="row toolbar">
+        <nav id="browse-crumbs" class="crumbs" aria-label="Folder"></nav>
+        <label id="browse-upload" class="button">Upload here<input id="browse-upload-input" type="file" multiple hidden></label>
+      </div>
+      <div id="browse-hint" class="muted" hidden></div>
+      <ul id="browse-list" class="list"></ul>
+    </div>
+    <div id="browse-editor" class="dialog-body" hidden>
+      <div class="row toolbar">
+        <span id="editor-path" class="ellipsis"></span>
+        <span id="editor-meta" class="muted"></span>
+      </div>
+      <div id="editor-note" class="warning" hidden>Wine rewrites registry files while programs run on this drive. Use “Stop all programs on this drive” before editing, or your change may be overwritten.</div>
+      <textarea id="editor-text" spellcheck="false" aria-label="File contents"></textarea>
+      <div class="row buttons">
+        <button id="editor-save" class="primary">Save</button>
+        <button id="editor-close">Back to folder</button>
+      </div>
+    </div>
+    <div id="browse-status" class="muted"></div>
   </dialog>
 
   <script src="app.js"></script>
