@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+<menu id="root-menu" label="MENU">
+<item label="Wine File Manager (main)"><action name="Execute"><command>umbrel-wine winefile</command></action></item>
+<item label="Wine Configuration (main)"><action name="Execute"><command>umbrel-wine winecfg</command></action></item>
+<item label="Wine Task Manager (main)"><action name="Execute"><command>umbrel-wine taskmgr</command></action></item>
+<item label="Stop all Wine programs (main)"><action name="Execute"><command>umbrel-wine --server -k</command></action></item>
+<!-- Kept for debugging; sudo is disabled (DISABLE_SUDO=true). -->
+<item label="xterm" icon="/usr/share/pixmaps/xterm-color_48x48.xpm"><action name="Execute"><command>/usr/bin/xterm</command></action></item>
+</menu>
+</openbox_menu>

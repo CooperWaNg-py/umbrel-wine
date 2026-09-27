@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# umbrel-wine [--drive NAME] [--server] ARGS...
+#
+# Runs Wine (or wineserver with --server) inside one "drive": a separate Wine
+# prefix under /config/drives/<NAME>/prefix. The drive defaults to `main`.
+#
+# The same x86_64 WoW64 Wine build ships on both arches. amd64 runs it natively;
+# arm64 runs it through box64, called explicitly because binfmt_misc is a
+# host-kernel setting an Umbrel app cannot rely on.
+set -euo pipefail
+
+drive=main
+server=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --drive)
+      [[ $# -ge 2 ]] || { echo "umbrel-wine: invalid drive name" >&2; exit 2; }
+      drive="$2"
+      shift 2
+      ;;
+    --server)
+      server=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ ! "$drive" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; then
+  echo "umbrel-wine: invalid drive name" >&2
+  exit 2
+fi
+
+export WINEPREFIX="/config/drives/$drive/prefix"
+export WINEDEBUG="${WINEDEBUG:-fixme-all}"
+# No Linux menu entries or file associations; installers still write their
+# Windows .lnk files, which the launcher lists as installed programs.
+export WINEDLLOVERRIDES="winemenubuilder.exe=d"
+export BOX64_NOBANNER=1
+export BOX64_LOG=0
+
+# Containers inherit an unlimited core rlimit and core_pattern=core, so any
+# crashing program would drop a core dump of hundreds of MB into its working
+# directory, i.e. the user's drive (observed: 288 MB in C:\windows).
+ulimit -c 0
+
+if [[ "$server" == 1 ]]; then
+  prog=/opt/wine/bin/wineserver
+else
+  prog=/opt/wine/bin/wine
+fi
+
+arch="$(uname -m)"
+case "$arch" in
+  x86_64)
+    exec "$prog" "$@"
+    ;;
+  aarch64)
+    exec box64 "$prog" "$@"
+    ;;
+  *)
+    echo "umbrel-wine: unsupported architecture $arch" >&2
+    exit 3
+    ;;
+esac

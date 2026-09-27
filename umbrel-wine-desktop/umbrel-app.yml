@@ -1,0 +1,55 @@
+# umbrelOS 2.0 only: the Selkies stream decodes with WebCodecs, which browsers
+# enable only in a secure context. umbrelOS 2.0 serves every app port over both
+# http and https, and `requiresHttps` makes the dashboard open the https one.
+# umbreld accepts the app when semver.gte(<os version>, manifestVersion).
+manifestVersion: "2.0.0"
+# `id` MUST equal this directory's name AND start with the store id
+# (`umbrel-wine`) — umbrelOS silently drops apps that fail
+# `app.id.startsWith(store.id)`.
+id: umbrel-wine-desktop
+category: developer
+name: Wine
+version: "0.1.0"
+tagline: Run Windows programs in your browser
+description: >-
+  REQUIRES umbrelOS 2.0 AND OPENS OVER HTTPS. The desktop is streamed as video
+  that browsers only decode on secure pages, so Wine opens on the https address
+  of your Umbrel. The first visit shows a browser certificate warning unless you
+  trust the "Umbrel Local HTTPS CA" (Settings → Advanced settings → Network →
+  HTTPS access).
+
+
+  Upload Windows .exe files and run them with Wine on your Umbrel. The Windows
+  desktop streams to your browser, and your keyboard and mouse control it. Files
+  are uploaded into drives: each drive is a separate Windows environment with its
+  own C: drive, registry and installed programs. A `main` drive exists by
+  default; create more for other tasks, and reset or delete them at any time.
+
+
+  On a Raspberry Pi, x86 programs are emulated with box64. They run much slower
+  than on a PC, 3D-accelerated games will not work, and Raspberry Pi 5 support is
+  experimental.
+
+
+  Tailscale addresses are not covered by the Umbrel certificate, so the video
+  will not decode when you open the app through Tailscale.
+developer: CooperWaNg-py
+website: https://github.com/CooperWaNg-py/umbrel-wine
+dependencies: []
+repo: https://github.com/CooperWaNg-py/umbrel-wine
+support: https://github.com/CooperWaNg-py/umbrel-wine/issues
+port: 4190
+requiresHttps: true
+# Community stores use `icon` and `gallery` verbatim; the default fallback
+# (getumbrel.github.io/umbrel-apps-gallery/<id>/...) 404s for custom repos, so
+# both MUST be absolute URLs.
+# Assets live in this repo under assets/; raw.githubusercontent serves them.
+icon: https://raw.githubusercontent.com/CooperWaNg-py/umbrel-wine/main/assets/icon.svg
+gallery:
+  - https://raw.githubusercontent.com/CooperWaNg-py/umbrel-wine/main/assets/gallery/1.jpg
+  - https://raw.githubusercontent.com/CooperWaNg-py/umbrel-wine/main/assets/gallery/2.jpg
+path: ""
+submitter: CooperWaNg-py
+submission: https://github.com/CooperWaNg-py/umbrel-wine
+releaseNotes: >-
+  Initial release.

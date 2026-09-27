@@ -1,0 +1,1047 @@
+"""Umbrel Wine launcher: upload .exe files into drives and run them with Wine.
+
+A drive is one Wine prefix (its own C: drive and registry) plus the .exe files
+uploaded to it:
+
+    <root>/drives/<drive>/prefix/   WINEPREFIX
+    <root>/drives/<drive>/files/    uploaded .exe files
+    <root>/logs/<drive>-<YYYYmmdd-HHMMSS>-<stem>.log
+
+Python 3 stdlib only. Importing this module has no side effects; only main()
+starts threads or binds a socket, so the tests can import it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
+
+DRIVE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,199}\.[Ee][Xx][Ee]$")
+
+MAIN_DRIVE = "main"
+CHUNK = 1024 * 1024
+UPLOAD_RESERVE = 512 * 1024 * 1024
+MAX_LOGS = 50
+LOG_TAIL = 64 * 1024
+MAX_JSON_BODY = 64 * 1024
+KILL_TIMEOUT = 10
+STOP_GRACE = 5
+# Upper bound on draining a rejected upload's body; see Handler._linger.
+LINGER_SECONDS = 10
+# `wineserver -w` after wineboot flushes the registry. It would block forever if
+# something else keeps the server alive (e.g. winecfg opened from the Openbox
+# menu on `main`), so the single init worker gives up waiting after this long.
+FLUSH_TIMEOUT = 120
+
+PROGRAM_DIRS = (
+    "drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs",
+    "drive_c/users/*/AppData/Roaming/Microsoft/Windows/Start Menu/Programs",
+    "drive_c/users/*/Desktop",
+    "drive_c/users/Public/Desktop",
+)
+
+STATIC_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+}
+
+WARN_16K = (
+    "16K-page kernel detected (Raspberry Pi 5): Wine under box64 is "
+    "experimental on this hardware."
+)
+WARN_BOX64 = (
+    "x86 programs are emulated with box64 on this device; expect them to run "
+    "much slower than on a PC."
+)
+
+
+class ApiError(Exception):
+    """An error that maps directly onto a JSON error response."""
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+# --------------------------------------------------------------------------
+# Pure helpers
+# --------------------------------------------------------------------------
+
+
+def validate_drive_name(s: str) -> bool:
+    return isinstance(s, str) and DRIVE_NAME_RE.match(s) is not None
+
+
+def validate_upload_name(s: str) -> bool:
+    return (
+        isinstance(s, str)
+        and s == os.path.basename(s)
+        and UPLOAD_NAME_RE.match(s) is not None
+    )
+
+
+def scan_programs(prefix: Path) -> list[dict]:
+    """Start Menu and Desktop shortcuts in a prefix, minus uninstallers."""
+    found: dict[str, str] = {}
+    for pattern in PROGRAM_DIRS:
+        for base in sorted(prefix.glob(pattern)):
+            if not base.is_dir():
+                continue
+            for lnk in sorted(base.rglob("*")):
+                if lnk.suffix.lower() != ".lnk" or not lnk.is_file():
+                    continue
+                if "uninstall" in lnk.stem.lower() or lnk.stem in found:
+                    continue
+                found[lnk.stem] = lnk.relative_to(prefix).as_posix()
+    return [
+        {"name": name, "path": found[name]}
+        for name in sorted(found, key=str.casefold)
+    ]
+
+
+def resolve_program(prefix: Path, rel) -> Path | None:
+    """Absolute path of a shortcut inside prefix/drive_c, or None.
+
+    Containment is checked on the normalised path rather than the
+    symlink-resolved one: Wine links users/<name>/Desktop to $HOME/Desktop when
+    that exists, so a legitimate shortcut can resolve outside the prefix. `..`
+    components are collapsed first, so they cannot escape drive_c.
+    """
+    if not isinstance(rel, str) or not rel or "\x00" in rel:
+        return None
+    base = os.path.normpath(os.path.join(os.path.abspath(prefix), "drive_c"))
+    target = os.path.normpath(os.path.join(os.path.abspath(prefix), rel))
+    if not target.startswith(base + os.sep):
+        return None
+    if not target.lower().endswith(".lnk") or not os.path.isfile(target):
+        return None
+    return Path(target)
+
+
+# LinkFlags bits from MS-SHLLINK 2.1.1.
+LNK_HAS_IDLIST = 0x01
+LNK_HAS_LINKINFO = 0x02
+LNK_STRING_FLAGS = (0x04, 0x08, 0x10, 0x20, 0x40)  # name, relpath, workdir, args, icon
+LNK_IS_UNICODE = 0x80
+
+
+def _c_string(data: bytes, off: int, unicode: bool) -> str:
+    if unicode:
+        end = off
+        while end + 1 < len(data) and data[end:end + 2] != b"\0\0":
+            end += 2
+        return data[off:end].decode("utf-16-le")
+    end = data.index(b"\0", off)
+    return data[off:end].decode("cp1252", errors="replace")
+
+
+def parse_lnk(data: bytes) -> dict | None:
+    """Target path, working directory and arguments of a Windows shortcut.
+
+    Returns {"target", "workdir", "args"} (Windows paths/strings; workdir and
+    args may be ""), or None when the shortcut has no local target path.
+    """
+    try:
+        if len(data) < 0x4C or struct.unpack_from("<I", data, 0)[0] != 0x4C:
+            return None
+        flags = struct.unpack_from("<I", data, 20)[0]
+        off = 0x4C
+        if flags & LNK_HAS_IDLIST:
+            off += 2 + struct.unpack_from("<H", data, off)[0]
+        target = ""
+        if flags & LNK_HAS_LINKINFO:
+            size, hsize, liflags, _vol, base, _net, suffix = struct.unpack_from("<7I", data, off)
+            if liflags & 1:  # VolumeIDAndLocalBasePath
+                if hsize >= 0x24:
+                    base_u, suffix_u = struct.unpack_from("<2I", data, off + 28)
+                    target = _c_string(data, off + base_u, True) + _c_string(data, off + suffix_u, True)
+                else:
+                    target = _c_string(data, off + base, False) + _c_string(data, off + suffix, False)
+            off += size
+        unicode = bool(flags & LNK_IS_UNICODE)
+        strings = {}
+        for bit in LNK_STRING_FLAGS:
+            if flags & bit:
+                count = struct.unpack_from("<H", data, off)[0]
+                off += 2
+                width = 2 if unicode else 1
+                raw = data[off:off + count * width]
+                strings[bit] = raw.decode("utf-16-le") if unicode else raw.decode("cp1252", errors="replace")
+                off += count * width
+    except (struct.error, ValueError, UnicodeDecodeError):
+        return None
+    if not target:
+        return None
+    return {"target": target, "workdir": strings.get(0x10, ""), "args": strings.get(0x20, "")}
+
+
+def split_windows_args(s: str) -> list[str]:
+    """Split a Windows command line the way CommandLineToArgvW does.
+
+    Wine rebuilds (and re-quotes) the command line from argv, so splitting here
+    preserves what the program sees.
+    """
+    args, cur, quoted, have, i, n = [], [], False, False, 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            j = i
+            while j < n and s[j] == "\\":
+                j += 1
+            count = j - i
+            if j < n and s[j] == '"':
+                cur.append("\\" * (count // 2))
+                if count % 2:
+                    cur.append('"')
+                    j += 1
+            else:
+                cur.append("\\" * count)
+            i, have = j, True
+        elif c == '"':
+            if quoted and i + 1 < n and s[i + 1] == '"':
+                cur.append('"')
+                i += 2
+            else:
+                quoted = not quoted
+                i += 1
+            have = True
+        elif c in " \t" and not quoted:
+            if have:
+                args.append("".join(cur))
+                cur, have = [], False
+            i += 1
+        else:
+            cur.append(c)
+            have = True
+            i += 1
+    if have:
+        args.append("".join(cur))
+    return args
+
+
+def win_to_unix(prefix: Path, win_path: str) -> Path | None:
+    """C:\\... inside the prefix's drive_c; None for other drives or `..`."""
+    m = re.match(r"^[Cc]:\\?(.*)$", win_path or "")
+    if not m:
+        return None
+    parts = [p for p in m.group(1).split("\\") if p and p != "."]
+    if ".." in parts:
+        return None
+    return Path(prefix, "drive_c", *parts)
+
+
+def program_command(prefix: Path, lnk: Path) -> tuple[list[str], Path]:
+    """argv tail and cwd for running an installed program's shortcut.
+
+    The shortcut's target runs directly so the run tracks the program itself.
+    `start /wait <lnk>` cannot: for a .lnk, Wine's ShellExecuteEx starts the
+    target without returning its process handle, so start.exe returns at once
+    with a garbage exit code. Shortcuts without a local target (e.g. URLs) are
+    still opened through `start`, which then only reports the hand-off.
+    """
+    try:
+        info = parse_lnk(lnk.read_bytes())
+    except OSError:
+        info = None
+    if info is None:
+        return ["start", "/unix", str(lnk)], lnk.parent
+    cwd = win_to_unix(prefix, info["workdir"]) if info["workdir"] else None
+    if cwd is None or not cwd.is_dir():
+        target_dir = win_to_unix(prefix, info["target"].rsplit("\\", 1)[0])
+        cwd = target_dir if target_dir is not None and target_dir.is_dir() else lnk.parent
+    return [info["target"], *split_windows_args(info["args"])], cwd
+
+
+def sanitize_stem(label: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(label).stem).strip("._")
+    return stem[:64] or "program"
+
+
+def new_log_path(logs: Path, drive: str, label: str) -> Path:
+    logs.mkdir(parents=True, exist_ok=True)
+    base = f"{drive}-{time.strftime('%Y%m%d-%H%M%S')}-{sanitize_stem(label)}"
+    path = logs / f"{base}.log"
+    n = 2
+    while path.exists():
+        path = logs / f"{base}-{n}.log"
+        n += 1
+    return path
+
+
+def prune_logs(logs: Path, keep: int = MAX_LOGS) -> None:
+    try:
+        entries = [p for p in logs.iterdir() if p.is_file()]
+    except FileNotFoundError:
+        return
+    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in entries[keep:]:
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def kill_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Config:
+    root: Path
+    port: int
+    bind: str
+    runner: str
+    web: Path
+    wait_x: bool
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        env = os.environ
+        return cls(
+            root=Path(env.get("UMBREL_WINE_ROOT", "/config")),
+            port=int(env.get("UMBREL_WINE_PORT", "8090")),
+            bind=env.get("UMBREL_WINE_BIND", "127.0.0.1"),
+            runner=env.get("UMBREL_WINE_RUNNER", "/usr/local/bin/umbrel-wine"),
+            web=Path(env.get("UMBREL_WINE_WEB", "/opt/umbrel-wine/web")),
+            wait_x=env.get("UMBREL_WINE_WAIT_X", "1") == "1",
+        )
+
+    @property
+    def drives(self) -> Path:
+        return self.root / "drives"
+
+    @property
+    def logs(self) -> Path:
+        return self.root / "logs"
+
+
+# --------------------------------------------------------------------------
+# Drives
+# --------------------------------------------------------------------------
+
+
+class DriveManager:
+    """Drive lifecycle. Prefixes are initialised by ONE worker thread, one
+    drive at a time: parallel wineboot on a Raspberry Pi is very slow."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        # name -> {"state", "error_message", "gen"}; gen invalidates queued or
+        # in-flight inits when a drive is reset or deleted.
+        self._drives: dict[str, dict] = {}
+        self._queue: queue.Queue = queue.Queue()
+        self._init_proc: tuple[str, subprocess.Popen] | None = None
+
+    # -- paths ---------------------------------------------------------------
+
+    def drive_dir(self, name: str) -> Path:
+        return self.cfg.drives / name
+
+    def prefix(self, name: str) -> Path:
+        return self.drive_dir(name) / "prefix"
+
+    def files_dir(self, name: str) -> Path:
+        return self.drive_dir(name) / "files"
+
+    # -- startup -------------------------------------------------------------
+
+    def load(self) -> None:
+        """Pick up existing drives, create `main`, queue unready prefixes."""
+        self.cfg.drives.mkdir(parents=True, exist_ok=True)
+        main = self.drive_dir(MAIN_DRIVE)
+        if not main.exists():
+            (main / "files").mkdir(parents=True, exist_ok=True)
+            (main / "prefix").mkdir(parents=True, exist_ok=True)
+        for d in sorted(self.cfg.drives.iterdir()):
+            if not d.is_dir() or not validate_drive_name(d.name):
+                continue
+            (d / "files").mkdir(exist_ok=True)
+            (d / "prefix").mkdir(exist_ok=True)
+            for part in (d / "files").glob(".upload-*.part"):
+                part.unlink(missing_ok=True)
+            with self._lock:
+                self._drives[d.name] = {"state": "ready", "error_message": None, "gen": 0}
+                if not (d / "prefix" / "system.reg").exists():
+                    self._enqueue_locked(d.name)
+
+    def start_worker(self) -> None:
+        threading.Thread(target=self._worker, name="drive-init", daemon=True).start()
+
+    # -- queries -------------------------------------------------------------
+
+    def names(self) -> list[str]:
+        with self._lock:
+            rest = sorted(n for n in self._drives if n != MAIN_DRIVE)
+            return ([MAIN_DRIVE] if MAIN_DRIVE in self._drives else []) + rest
+
+    def info(self, name: str) -> dict:
+        with self._lock:
+            d = self._drives.get(name)
+            if d is None:
+                raise ApiError(404, "no_such_drive", f"No drive named {name!r}.")
+            return {"state": d["state"], "error_message": d["error_message"]}
+
+    def require(self, name: str) -> None:
+        self.info(name)
+
+    # -- operations ----------------------------------------------------------
+
+    def create(self, name) -> tuple[int, dict]:
+        if not validate_drive_name(name):
+            raise ApiError(
+                400, "invalid_name",
+                "Use lowercase letters, digits and dashes (max 32).",
+            )
+        with self._lock:
+            if name in self._drives or self.drive_dir(name).exists():
+                raise ApiError(409, "exists", f"Drive {name!r} already exists.")
+            self.files_dir(name).mkdir(parents=True)
+            self.prefix(name).mkdir(parents=True)
+            self._drives[name] = {"state": "initializing", "error_message": None, "gen": 0}
+            self._enqueue_locked(name)
+        return 201, {"name": name}
+
+    def reset(self, name: str) -> tuple[int, dict]:
+        self.require(name)
+        self._stop_drive(name)
+        with self._lock:
+            if name not in self._drives:
+                raise ApiError(404, "no_such_drive", f"No drive named {name!r}.")
+            shutil.rmtree(self.prefix(name), ignore_errors=True)
+            self.prefix(name).mkdir(parents=True, exist_ok=True)
+            self._enqueue_locked(name)
+        return 202, {"name": name}
+
+    def delete(self, name: str) -> tuple[int, None]:
+        if name == MAIN_DRIVE:
+            raise ApiError(400, "cannot_delete_main", "The main drive cannot be deleted.")
+        self.require(name)
+        self._stop_drive(name)
+        with self._lock:
+            self._drives.pop(name, None)
+        shutil.rmtree(self.drive_dir(name), ignore_errors=True)
+        return 204, None
+
+    def kill_server(self, name: str) -> None:
+        """`wineserver -k` for the drive: ends every Wine program on it."""
+        try:
+            subprocess.run(
+                [self.cfg.runner, "--drive", name, "--server", "-k"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=KILL_TIMEOUT,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # -- internals -----------------------------------------------------------
+
+    def _stop_drive(self, name: str) -> None:
+        with self._lock:
+            d = self._drives.get(name)
+            if d is not None:
+                d["gen"] += 1  # invalidates any queued/in-flight init
+            current = self._init_proc
+        if current is not None and current[0] == name:
+            kill_group(current[1].pid, signal.SIGKILL)
+        self.kill_server(name)
+
+    def _enqueue_locked(self, name: str) -> None:
+        d = self._drives[name]
+        d["gen"] += 1
+        d["state"] = "initializing"
+        d["error_message"] = None
+        self._queue.put((name, d["gen"]))
+
+    def _current(self, name: str, gen: int) -> bool:
+        with self._lock:
+            d = self._drives.get(name)
+            return d is not None and d["gen"] == gen
+
+    def _wait_for_x(self) -> None:
+        while True:
+            try:
+                ok = subprocess.run(
+                    ["xset", "q"], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                ).returncode == 0
+            except OSError:
+                ok = False
+            if ok:
+                return
+            time.sleep(0.5)
+
+    def _worker(self) -> None:
+        while True:
+            name, gen = self._queue.get()
+            if not self._current(name, gen):
+                continue
+            try:
+                self._init_drive(name, gen)
+            except Exception as e:  # keep the single worker alive
+                with self._lock:
+                    d = self._drives.get(name)
+                    if d is not None and d["gen"] == gen:
+                        d["state"] = "error"
+                        d["error_message"] = f"initialisation failed: {e}"
+
+    def _run_init(self, name: str, argv: list[str], log, timeout=None) -> int:
+        proc = subprocess.Popen(
+            [self.cfg.runner, "--drive", name, *argv],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        with self._lock:
+            self._init_proc = (name, proc)
+        try:
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return -1
+        finally:
+            with self._lock:
+                self._init_proc = None
+
+    def _init_drive(self, name: str, gen: int) -> None:
+        if self.cfg.wait_x:
+            self._wait_for_x()
+        log_path = new_log_path(self.cfg.logs, name, "wineboot")
+        prune_logs(self.cfg.logs)
+        with open(log_path, "ab") as log:
+            code = self._run_init(name, ["wineboot", "-i"], log)
+            if self._current(name, gen):
+                self._run_init(name, ["--server", "-w"], log, timeout=FLUSH_TIMEOUT)
+        ok = (self.prefix(name) / "system.reg").exists()
+        with self._lock:
+            d = self._drives.get(name)
+            if d is None or d["gen"] != gen:
+                return
+            if ok:
+                d["state"] = "ready"
+                d["error_message"] = None
+            else:
+                d["state"] = "error"
+                d["error_message"] = f"wineboot failed (exit {code}); see log {log_path.name}"
+
+
+# --------------------------------------------------------------------------
+# Runs
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Run:
+    id: str
+    drive: str
+    label: str
+    started: float
+    proc: subprocess.Popen
+    log_path: Path
+    ended: float | None = None
+    exit_code: int | None = None
+
+    def to_json(self) -> dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "started": self.started,
+            "ended": self.ended,
+            "exit_code": self.exit_code,
+            "running": self.ended is None,
+        }
+
+
+class RunManager:
+    """Programs started from the UI. In memory only: lost when the launcher
+    restarts, which is what "Stop all on this drive" (wineserver -k) covers."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._runs: dict[str, Run] = {}
+
+    def start(self, drive: str, argv_tail: list[str], cwd: Path, label: str) -> Run:
+        log_path = new_log_path(self.cfg.logs, drive, label)
+        with open(log_path, "ab") as log:
+            proc = subprocess.Popen(
+                [self.cfg.runner, "--drive", drive, *argv_tail],
+                cwd=cwd, stdin=subprocess.DEVNULL, stdout=log,
+                stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        prune_logs(self.cfg.logs)
+        run = Run(uuid.uuid4().hex[:12], drive, label, time.time(), proc, log_path)
+        with self._lock:
+            self._runs[run.id] = run
+        threading.Thread(target=self._wait, args=(run,), daemon=True).start()
+        return run
+
+    def _wait(self, run: Run) -> None:
+        code = run.proc.wait()
+        with self._lock:
+            run.exit_code = code
+            run.ended = time.time()
+
+    def get(self, run_id: str) -> Run:
+        with self._lock:
+            run = self._runs.get(run_id)
+        if run is None:
+            raise ApiError(404, "no_such_run", f"No run with id {run_id!r}.")
+        return run
+
+    def for_drive(self, drive: str) -> list[dict]:
+        with self._lock:
+            runs = [r for r in self._runs.values() if r.drive == drive]
+            return [r.to_json() for r in sorted(runs, key=lambda r: r.started, reverse=True)]
+
+    def forget_drive(self, drive: str) -> None:
+        with self._lock:
+            for rid in [i for i, r in self._runs.items() if r.drive == drive]:
+                del self._runs[rid]
+
+    def stop(self, run_id: str) -> tuple[int, dict]:
+        run = self.get(run_id)
+        if run.proc.poll() is None:
+            kill_group(run.proc.pid, signal.SIGTERM)
+
+            def escalate():
+                time.sleep(STOP_GRACE)
+                if run.proc.poll() is None:
+                    kill_group(run.proc.pid, signal.SIGKILL)
+
+            threading.Thread(target=escalate, daemon=True).start()
+        return 202, {"id": run.id}
+
+    def log_tail(self, run_id: str) -> bytes:
+        run = self.get(run_id)
+        try:
+            with open(run.log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - LOG_TAIL))
+                return f.read()
+        except FileNotFoundError:
+            return b""
+
+
+# --------------------------------------------------------------------------
+# Application
+# --------------------------------------------------------------------------
+
+
+class App:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.drives = DriveManager(cfg)
+        self.runs = RunManager(cfg)
+        self.arch = os.uname().machine
+        self.page_size = os.sysconf("SC_PAGE_SIZE")
+        self.wine_version: str | None = None
+
+    def start(self) -> None:
+        self.cfg.logs.mkdir(parents=True, exist_ok=True)
+        self.drives.load()
+        self.drives.start_worker()
+        # Off the request path: under box64 on a Pi this takes seconds.
+        threading.Thread(target=self._probe_version, daemon=True).start()
+
+    def _probe_version(self) -> None:
+        try:
+            out = subprocess.run(
+                [self.cfg.runner, "--version"], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=30,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                self.wine_version = out.stdout.strip()
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    def status(self) -> dict:
+        warnings = []
+        if self.arch == "aarch64":
+            if self.page_size == 16384:
+                warnings.append(WARN_16K)
+            warnings.append(WARN_BOX64)
+        return {
+            "arch": self.arch,
+            "backend": "box64" if self.arch == "aarch64" else "native",
+            "page_size": self.page_size,
+            "wine_version": self.wine_version,
+            "warnings": warnings,
+        }
+
+    def list_files(self, drive: str) -> list[dict]:
+        out = []
+        try:
+            entries = list(self.drives.files_dir(drive).iterdir())
+        except FileNotFoundError:
+            return out
+        for p in entries:
+            # Only names the API can run/delete; hides .upload-*.part files and
+            # anything a program wrote next to its .exe.
+            if not validate_upload_name(p.name) or not p.is_file():
+                continue
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size, "mtime": int(st.st_mtime)})
+        out.sort(key=lambda f: f["name"].casefold())
+        return out
+
+    def list_drives(self) -> list[dict]:
+        result = []
+        for name in self.drives.names():
+            try:
+                info = self.drives.info(name)
+            except ApiError:
+                continue  # deleted between names() and info()
+            result.append({
+                "name": name,
+                "state": info["state"],
+                "error_message": info["error_message"],
+                "files": self.list_files(name),
+                "programs": scan_programs(self.drives.prefix(name)),
+                "runs": self.runs.for_drive(name),
+            })
+        return result
+
+    def delete_drive(self, name: str) -> tuple[int, None]:
+        result = self.drives.delete(name)
+        self.runs.forget_drive(name)
+        return result
+
+    def run(self, drive: str, body) -> tuple[int, dict]:
+        info = self.drives.info(drive)
+        if info["state"] != "ready":
+            raise ApiError(409, "drive_not_ready", f"Drive {drive!r} is not ready yet.")
+        if not isinstance(body, dict):
+            raise ApiError(400, "bad_request", "Expected a JSON object.")
+        if "file" in body:
+            name = body["file"]
+            if not validate_upload_name(name):
+                raise ApiError(400, "invalid_name", "Invalid file name.")
+            files = self.drives.files_dir(drive)
+            path = files / name
+            if not path.is_file():
+                raise ApiError(404, "no_such_file", f"No file named {name!r} on this drive.")
+            run = self.runs.start(drive, [str(path)], cwd=files, label=name)
+        elif "program" in body:
+            lnk = resolve_program(self.drives.prefix(drive), body["program"])
+            if lnk is None:
+                raise ApiError(400, "invalid_program", "Unknown program.")
+            argv, cwd = program_command(self.drives.prefix(drive), lnk)
+            run = self.runs.start(drive, argv, cwd=cwd, label=lnk.stem)
+        else:
+            raise ApiError(400, "bad_request", 'Expected "file" or "program".')
+        return 201, {"id": run.id}
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+
+ROUTES = [
+    (re.compile(r"^/api/status$"), {"GET": "get_status"}),
+    (re.compile(r"^/api/drives$"), {"GET": "get_drives", "POST": "post_drive"}),
+    (re.compile(r"^/api/drives/([^/]+)$"), {"DELETE": "delete_drive"}),
+    (re.compile(r"^/api/drives/([^/]+)/reset$"), {"POST": "post_reset"}),
+    (re.compile(r"^/api/drives/([^/]+)/stop-all$"), {"POST": "post_stop_all"}),
+    (re.compile(r"^/api/drives/([^/]+)/run$"), {"POST": "post_run"}),
+    (re.compile(r"^/api/drives/([^/]+)/files/([^/]+)$"), {"PUT": "put_file", "DELETE": "delete_file"}),
+    (re.compile(r"^/api/runs/([^/]+)/stop$"), {"POST": "post_run_stop"}),
+    (re.compile(r"^/api/runs/([^/]+)/log$"), {"GET": "get_run_log"}),
+]
+
+
+class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 so keep-alive works and Expect: 100-continue can be answered
+    # only AFTER the upload pre-checks pass (see handle_expect_100).
+    protocol_version = "HTTP/1.1"
+    server_version = "umbrel-wine"
+    app: App  # set by make_server
+
+    # -- plumbing ------------------------------------------------------------
+
+    def handle_expect_100(self):
+        # Defer: put_file sends 100 Continue once its checks pass, so a
+        # rejected upload is refused before the client sends the body.
+        return True
+
+    def log_request(self, code="-", size="-"):
+        if self.command != "GET" or (isinstance(code, int) and code >= 400):
+            super().log_request(code, size)
+
+    def send_error(self, code, message=None, explain=None):
+        # http.server's own errors (bad request line, unknown method) as JSON.
+        self.close_connection = True
+        self._send_json(code, {"error": "http_error", "message": message or self.responses.get(code, ("",))[0]}, close=True)
+
+    def _send_body(self, status: int, body: bytes, ctype: str, close=False, extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        if close:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _send_json(self, status: int, obj, close=False):
+        if status == 204:
+            self.send_response(204)
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            return
+        body = json.dumps(obj).encode()
+        self._send_body(status, body, "application/json", close=close)
+
+    def _send_api_error(self, e: ApiError, close=False):
+        self._send_json(e.status, {"error": e.code, "message": e.message}, close=close)
+
+    def _read_json(self):
+        length = self.headers.get("Content-Length")
+        if length is None:
+            return {}
+        try:
+            n = int(length)
+        except ValueError:
+            raise ApiError(400, "bad_request", "Invalid Content-Length.")
+        if n < 0 or n > MAX_JSON_BODY:
+            self.close_connection = True
+            raise ApiError(413, "too_large", "Request body too large.")
+        raw = self.rfile.read(n) if n else b""
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise ApiError(400, "bad_request", "Body is not valid JSON.")
+
+    def _dispatch(self):
+        parts = urlsplit(self.path)
+        self.query = parse_qs(parts.query)
+        path = parts.path
+        try:
+            if path in STATIC_FILES:
+                if self.command not in ("GET", "HEAD"):
+                    raise ApiError(405, "method_not_allowed", "Method not allowed.")
+                return self._static(path)
+            for pattern, methods in ROUTES:
+                m = pattern.match(path)
+                if not m:
+                    continue
+                handler = methods.get(self.command)
+                if handler is None:
+                    raise ApiError(405, "method_not_allowed", "Method not allowed.")
+                return getattr(self, handler)(*(unquote(g) for g in m.groups()))
+            raise ApiError(404, "not_found", "Not found.")
+        except ApiError as e:
+            self._send_api_error(e, close=self.close_connection)
+        except Exception as e:  # never leak a traceback page
+            self.log_error("internal error: %r", e)
+            self._send_json(500, {"error": "internal", "message": str(e)}, close=True)
+
+    do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = _dispatch
+
+    # -- static ------------------------------------------------------------
+
+    def _static(self, path: str):
+        fname, ctype = STATIC_FILES[path]
+        try:
+            body = (self.app.cfg.web / fname).read_bytes()
+        except FileNotFoundError:
+            raise ApiError(404, "not_found", "Not found.")
+        self._send_body(200, body, ctype, extra={"Cache-Control": "no-cache"})
+
+    # -- API ---------------------------------------------------------------
+
+    def get_status(self):
+        self._send_json(200, self.app.status())
+
+    def get_drives(self):
+        self._send_json(200, self.app.list_drives())
+
+    def post_drive(self):
+        body = self._read_json()
+        name = body.get("name") if isinstance(body, dict) else None
+        self._send_json(*self.app.drives.create(name))
+
+    def delete_drive(self, drive):
+        self._send_json(*self.app.delete_drive(drive))
+
+    def post_reset(self, drive):
+        self._send_json(*self.app.drives.reset(drive))
+
+    def post_stop_all(self, drive):
+        self.app.drives.require(drive)
+        self.app.drives.kill_server(drive)
+        self._send_json(202, {})
+
+    def post_run(self, drive):
+        self.app.drives.require(drive)
+        body = self._read_json()
+        self._send_json(*self.app.run(drive, body))
+
+    def post_run_stop(self, run_id):
+        self._send_json(*self.app.runs.stop(run_id))
+
+    def get_run_log(self, run_id):
+        body = self.app.runs.log_tail(run_id)
+        text = body.decode("utf-8", errors="replace").encode("utf-8")
+        self._send_body(200, text, "text/plain; charset=utf-8", extra={"Cache-Control": "no-cache"})
+
+    def delete_file(self, drive, name):
+        self.app.drives.require(drive)
+        if not validate_upload_name(name):
+            raise ApiError(404, "no_such_file", f"No file named {name!r} on this drive.")
+        try:
+            (self.app.drives.files_dir(drive) / name).unlink()
+        except FileNotFoundError:
+            raise ApiError(404, "no_such_file", f"No file named {name!r} on this drive.")
+        self._send_json(204, None)
+
+    def put_file(self, drive, name):
+        self._upload_left = None  # body bytes still unread; None = unknown
+        try:
+            self._receive_upload(drive, name)
+        except ApiError as e:
+            self._send_api_error(e, close=True)
+            self._linger(self._upload_left)
+
+    def _linger(self, left):
+        """Lingering close after rejecting an upload early.
+
+        nginx streams the body to us unbuffered (proxy_request_buffering off).
+        If we closed right after the error response, its next write would hit
+        EPIPE before it read our response, and the browser would get a 502
+        instead of e.g. the 409 that drives the "Replace it?" prompt. So:
+        half-close (the response is complete), then discard the body until the
+        peer closes, it is fully consumed, or LINGER_SECONDS pass.
+        """
+        try:
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+        deadline = time.monotonic() + LINGER_SECONDS
+        while left is None or left > 0:
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                return
+            try:
+                self.connection.settimeout(wait)
+                data = self.connection.recv(CHUNK)
+            except OSError:  # includes the timeout
+                return
+            if not data:
+                return
+            if left is not None:
+                left -= len(data)
+
+    def _receive_upload(self, drive, name):
+        # Every check runs before any of the body is read; on failure the
+        # connection is closed so the unread body is never parsed as a request.
+        self.close_connection = True
+        self.app.drives.require(drive)
+        if not validate_upload_name(name):
+            raise ApiError(
+                400, "invalid_name",
+                "File names must end in .exe and use letters, digits, spaces and ._()+-",
+            )
+        length = self.headers.get("Content-Length")
+        if length is None:
+            raise ApiError(411, "length_required", "Content-Length is required.")
+        try:
+            total = int(length)
+            if total < 0:
+                raise ValueError
+        except ValueError:
+            raise ApiError(400, "bad_request", "Invalid Content-Length.")
+        self._upload_left = total
+        free = shutil.disk_usage(self.app.cfg.root).free
+        if total > free - UPLOAD_RESERVE:
+            raise ApiError(507, "insufficient_storage", "Not enough free space on the Umbrel for this file.")
+        files = self.app.drives.files_dir(drive)
+        target = files / name
+        if target.exists() and self.query.get("overwrite", [""])[0] != "1":
+            raise ApiError(409, "exists", f"{name} already exists on this drive.")
+
+        if self.headers.get("Expect", "").lower() == "100-continue":
+            self.send_response_only(100)
+            self.end_headers()
+
+        part = files / f".upload-{uuid.uuid4().hex}.part"
+        done = False
+        try:
+            with open(part, "wb") as f:
+                remaining = total
+                first = True
+                while remaining > 0 or first:
+                    chunk = self.rfile.read(min(CHUNK, remaining)) if remaining > 0 else b""
+                    if first:
+                        first = False
+                        if chunk[:2] != b"MZ":
+                            self._upload_left = remaining - len(chunk)
+                            raise ApiError(
+                                415, "not_a_windows_executable",
+                                f"{name} is not a Windows executable.",
+                            )
+                    if remaining > 0 and not chunk:
+                        return  # client went away mid-upload; nothing to answer
+                    f.write(chunk)
+                    remaining -= len(chunk)
+                    self._upload_left = remaining
+            os.replace(part, target)
+            done = True
+        finally:
+            if not done:
+                part.unlink(missing_ok=True)
+        self.close_connection = False
+        self._send_json(201, {"name": name, "size": total})
+
+
+def make_server(app: App) -> ThreadingHTTPServer:
+    handler = type("BoundHandler", (Handler,), {"app": app})
+    server = ThreadingHTTPServer((app.cfg.bind, app.cfg.port), handler)
+    server.daemon_threads = True
+    return server
+
+
+def main() -> None:
+    app = App(Config.from_env())
+    app.start()
+    server = make_server(app)
+    print(f"umbrel-wine launcher listening on {app.cfg.bind}:{server.server_port}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

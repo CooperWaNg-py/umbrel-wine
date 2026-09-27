@@ -1,0 +1,92 @@
+name: publish image
+
+# Builds the Umbrel Wine container as a MULTI-ARCH manifest list and pushes it to
+# GHCR. Multi-arch is not optional: umbrelOS runs on linux/amd64 and linux/arm64,
+# and the App Store linter hard-errors on a single-arch image. The compose file
+# pins the *index* digest, which only exists for a manifest list.
+#
+# Uses the built-in GITHUB_TOKEN, so no PAT or secret needs configuring.
+#
+# NOTE: a package pushed to GHCR is PRIVATE by default, even from a public repo.
+# After the first successful run, set it to public once:
+#   github.com/users/CooperWaNg-py/packages/container/umbrel-wine/settings
+# Otherwise umbrelOS cannot pull the image and the app install fails.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "image/**"
+      - ".github/workflows/publish-image.yml"
+  workflow_dispatch:
+
+env:
+  # GHCR rejects uppercase in image references, so this is the lowercased owner.
+  IMAGE: ghcr.io/cooperwang-py/umbrel-wine
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is built under emulation on an amd64 runner.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=0.1.0,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=sha,format=long
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./image
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false      # keep the index to just the two platform manifests
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The digest to paste into umbrel-wine-desktop/docker-compose.yml. It must be the
+      # index digest; a per-platform digest would pull correctly on one arch and
+      # fail on the other.
+      - name: Report index digest
+        run: |
+          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ env.IMAGE }}:0.1.0@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${{ env.IMAGE }}:0.1.0" >> "$GITHUB_STEP_SUMMARY"
+
+      # Fail loudly if the index somehow lacks a platform, rather than letting a
+      # broken pull surface on the user's device.
+      - name: Verify both platforms are present
+        run: |
+          set -euo pipefail
+          out="$(docker buildx imagetools inspect "${{ env.IMAGE }}:0.1.0" --raw)"
+          for p in '"architecture":"amd64"' '"architecture":"arm64"'; do
+            echo "$out" | tr -d ' \n' | grep -q "$p" || { echo "missing platform $p"; exit 1; }
+          done
+          echo "both linux/amd64 and linux/arm64 present"

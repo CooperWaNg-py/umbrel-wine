@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bash
+# with-contenv supplies DISPLAY=:1, HOME=/config and PULSE_RUNTIME_PATH=/defaults;
+# Wine children inherit them, so their audio reaches the Selkies Opus stream.
+exec s6-setuidgid abc python3 /opt/umbrel-wine/launcher.py

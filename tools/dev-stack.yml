@@ -1,0 +1,40 @@
+# Standalone compose stack for running Umbrel Wine OUTSIDE umbrelOS.
+#
+# This is NOT the Umbrel package -- umbrel-wine-desktop/docker-compose.yml is. Use
+# this for local development before the image is published and the community app
+# store is wired up. Differences from the real package:
+#
+#   * no `app_proxy` service (umbrelOS injects that image; compose cannot resolve it
+#     here), so `wine` publishes its port directly and has NO authentication
+#   * builds the image locally instead of pulling a digest-pinned multi-arch image
+#   * ${APP_DATA_DIR} is replaced by a plain ./appdata bind mount
+#
+# All other behaviour (Selkies settings, sudo disabled, routing) is baked into the
+# image, so what works here works in the package.
+#
+# Usage, from the repo root:
+#     mkdir -p appdata
+#     docker compose -f tools/dev-stack.yml up -d --build
+#     docker compose -f tools/dev-stack.yml logs -f wine
+#     # browse to http://localhost:8080 -- `localhost` counts as a secure context,
+#     # so the video decodes without HTTPS. For a remote dev box, tunnel it:
+#     #   ssh -L 8080:localhost:8080 <host>
+
+name: umbrel-wine-dev
+
+services:
+  wine:
+    build: ../image
+    image: umbrel-wine:dev
+    restart: unless-stopped
+    shm_size: "1gb"
+    ports:
+      # Published directly because there is no app_proxy here. On umbrelOS the
+      # proxy owns the host port and adds authentication; this is LAN-open.
+      - "8080:8080"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+    volumes:
+      - ../appdata:/config

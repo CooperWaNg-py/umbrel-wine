@@ -1,0 +1,19 @@
+#!/usr/bin/with-contenv bash
+# Runs after the base's init-selkies-config and before init-config-end, so it
+# lands after the base's first-run copy and before init-services starts the
+# desktop.
+
+mkdir -p /config/drives /config/logs /config/.config/openbox
+
+# Copied on EVERY boot. The base copies menu.xml/autostart only when absent, so
+# image updates would otherwise never reach existing installs.
+cp /defaults/menu.xml /config/.config/openbox/menu.xml
+cp /defaults/autostart /config/.config/openbox/autostart
+
+# Never recursive: prefixes under /config/drives are large.
+chown abc:abc \
+  /config/drives \
+  /config/logs \
+  /config/.config/openbox \
+  /config/.config/openbox/menu.xml \
+  /config/.config/openbox/autostart

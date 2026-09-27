@@ -1,0 +1,33 @@
+version: "3.7"
+
+# One container: Selkies desktop (Xvfb + Openbox), Wine, and the launcher, all
+# behind nginx on :8080 (/desktop/ -> Selkies, / -> launcher).
+#
+# The image is published as a multi-arch manifest list (linux/amd64 + linux/arm64)
+# by .github/workflows/publish-image.yml. Pin the INDEX digest here -- not a
+# per-platform digest, or one architecture will fail to pull:
+#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.1.0
+
+services:
+  # Required stub: umbrelOS only merges its app_proxy fragment if the service is
+  # declared here, and it reads APP_HOST/APP_PORT with readFromEnvOrTerminate —
+  # a missing value makes the proxy exit immediately. The host is the injected
+  # container name <app-id>_<service>_1. Umbrel session auth stays on; Selkies'
+  # own basic auth stays off (no PASSWORD / CUSTOM_USER).
+  app_proxy:
+    environment:
+      APP_HOST: umbrel-wine-desktop_wine_1
+      APP_PORT: 8080
+
+  wine:
+    image: ghcr.io/cooperwang-py/umbrel-wine:0.1.0@sha256:PIN_INDEX_DIGEST_FROM_CI
+    restart: on-failure
+    # LinuxServer's Selkies images document shm_size "1gb"; Docker's 64 MB
+    # default is too small for the desktop session.
+    shm_size: "1gb"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+    volumes:
+      - ${APP_DATA_DIR}/data:/config

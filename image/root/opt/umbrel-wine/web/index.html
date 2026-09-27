@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wine</title>
+  <!-- Every URL is relative so the page works behind any path prefix and on
+       both http and https. -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="layout">
+    <aside id="sidebar">
+      <header class="bar">
+        <button id="toggle" class="icon" title="Hide sidebar" aria-label="Toggle sidebar">☰</button>
+        <h1>Wine</h1>
+      </header>
+
+      <div id="sidebar-body">
+        <section>
+          <div id="status-line" class="muted">Connecting…</div>
+          <div id="warnings"></div>
+        </section>
+
+        <section>
+          <h2>Drive</h2>
+          <div class="row">
+            <select id="drive-select" aria-label="Drive"></select>
+            <span id="drive-badge" class="badge"></span>
+          </div>
+          <div class="row buttons">
+            <button id="drive-new">New drive</button>
+            <button id="drive-reset">Reset</button>
+            <button id="drive-delete" class="danger">Delete</button>
+          </div>
+          <div id="drive-note" class="note" hidden></div>
+        </section>
+
+        <section>
+          <h2>Upload</h2>
+          <label id="dropzone">
+            <input id="file-input" type="file" accept=".exe" multiple>
+            <span>Drop <b>.exe</b> files here or click to choose</span>
+          </label>
+          <div id="upload" hidden>
+            <div id="upload-name" class="ellipsis"></div>
+            <progress id="upload-progress" max="100" value="0"></progress>
+            <div id="upload-text" class="muted"></div>
+          </div>
+          <div id="upload-error" class="error" hidden></div>
+        </section>
+
+        <section>
+          <h2>Files</h2>
+          <ul id="files" class="list"></ul>
+        </section>
+
+        <section>
+          <h2>Installed programs</h2>
+          <ul id="programs" class="list"></ul>
+        </section>
+
+        <section>
+          <h2>Running</h2>
+          <ul id="runs" class="list"></ul>
+          <button id="stop-all" class="danger wide">Stop all programs on this drive</button>
+        </section>
+      </div>
+    </aside>
+
+    <main id="main">
+      <button id="toggle-open" class="icon floating" title="Show sidebar" aria-label="Show sidebar" hidden>☰</button>
+      <iframe id="desktop" src="desktop/" title="Wine desktop"
+              allow="fullscreen; clipboard-read; clipboard-write; gamepad; autoplay"></iframe>
+      <a id="open-tab" href="desktop/" target="_blank" rel="noopener">Open desktop in new tab</a>
+    </main>
+  </div>
+
+  <dialog id="log-dialog">
+    <header class="bar">
+      <h2 id="log-title">Log</h2>
+      <button id="log-close" class="icon" aria-label="Close">✕</button>
+    </header>
+    <pre id="log-text"></pre>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
