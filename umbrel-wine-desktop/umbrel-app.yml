@@ -13,7 +13,7 @@ name: Wine
 # Bump it in the same commit as (or after) the new image digest in
 # docker-compose.yml, never before: a device that polls the store in between
 # installs the old image under the new version and is never offered it again.
-version: "0.2.2"
+version: "0.2.3"
 tagline: Run Windows programs in your browser
 description: >-
   REQUIRES umbrelOS 2.0 AND OPENS OVER HTTPS. The desktop is streamed as video
@@ -36,6 +36,11 @@ description: >-
   and other text files) in an editor.
 
 
+  On an Umbrel Home, programs draw with the built-in graphics chip and the
+  desktop is streamed with its hardware video encoder, which keeps motion
+  smooth and leaves the CPU free for the programs themselves.
+
+
   On a Raspberry Pi, x86 programs are emulated with box64. They run much slower
   than on a PC, 3D-accelerated games will not work, and Raspberry Pi 5 support is
   experimental.
@@ -46,6 +51,11 @@ description: >-
 developer: CooperWaNg-py
 website: https://github.com/CooperWaNg-py/umbrel-wine
 dependencies: []
+# umbrelOS mounts /dev/dri (and the NVIDIA runtime, if present) only when the
+# host has a GPU. x86 hosts render and encode on it; arm64 opts out at startup
+# (init-umbrel-wine), since the Pi's GPU has no video encoder.
+permissions:
+  - GPU
 repo: https://github.com/CooperWaNg-py/umbrel-wine
 support: https://github.com/CooperWaNg-py/umbrel-wine/issues
 port: 4190
@@ -69,21 +79,19 @@ backupIgnore:
 submitter: CooperWaNg-py
 submission: https://github.com/CooperWaNg-py/umbrel-wine
 releaseNotes: >-
-  Faster, cancellable folder uploads: a folder now goes up as a single stream
-  instead of one request per file, so folders with thousands of small files
-  upload at the speed of your network. A Cancel button stops an upload, and a
-  cancelled, failed or interrupted upload never changes the drive: replacing
-  a folder keeps the old one until the new one has arrived completely.
+  Smoother, faster desktop streaming.
 
-  Security: other apps' pages on your Umbrel can no longer send commands to
-  Wine or take over its desktop in the background, and the desktop stream's
-  internal ports are no longer open to other containers on the Umbrel.
+  On an Umbrel Home, Wine now uses the built-in graphics chip: programs draw
+  with hardware OpenGL and the desktop is encoded by the hardware video
+  encoder, so motion is smoother and the CPU is left for the programs. The
+  app asks for GPU access for this; on a Raspberry Pi nothing changes.
 
-  Program logs are capped at about 4 MB each (start and end kept), so a
-  chatty program can no longer fill the Umbrel's disk. A drive whose setup
-  hangs now fails after 30 minutes instead of blocking every other drive,
-  and its setup log can be opened from the sidebar. "Stop all programs" is
-  disabled while a drive is being prepared, since it would break the setup.
+  On high-resolution screens (Retina laptops, phones) the desktop is now
+  streamed at the browser's normal resolution instead of 2-4x as many pixels,
+  which raises the frame rate on every device and makes Windows programs a
+  readable size. For the sharpest text, turn HiDPI back on in the Selkies
+  sidebar (the tab on the left edge of the desktop).
 
-  The sidebar no longer resets keyboard focus every two seconds, and logs and
-  caches are left out of Umbrel backups.
+  The encoder menu in that sidebar also offers striped H.264, which uses
+  every CPU core and only re-encodes the parts of the screen that changed.
+  Try it on a Raspberry Pi.
