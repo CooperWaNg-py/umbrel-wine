@@ -52,7 +52,10 @@
           <div id="upload" hidden>
             <div id="upload-name" class="ellipsis"></div>
             <progress id="upload-progress" max="100" value="0"></progress>
-            <div id="upload-text" class="muted"></div>
+            <div class="row">
+              <div id="upload-text" class="muted grow"></div>
+              <button id="upload-cancel" class="danger">Cancel</button>
+            </div>
           </div>
           <div id="upload-error" class="error" hidden></div>
         </section>
@@ -99,6 +102,7 @@
     <div id="browse-list-view" class="dialog-body">
       <div class="row toolbar">
         <nav id="browse-crumbs" class="crumbs" aria-label="Folder"></nav>
+        <button id="browse-upload-cancel" class="danger" hidden>Cancel upload</button>
         <label id="browse-upload" class="button">Upload here<input id="browse-upload-input" type="file" multiple hidden></label>
       </div>
       <div id="browse-hint" class="muted" hidden></div>

@@ -9,10 +9,12 @@ import os
 import shutil
 import struct
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "root" / "opt" / "umbrel-wine"))
@@ -20,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "root" / "opt" / "u
 import launcher  # noqa: E402
 
 # Stands in for /usr/local/bin/umbrel-wine. wineboot creates system.reg like the
-# real thing; the drive named `broken` fails every command.
+# real thing; the drive named `broken` fails every command, drives named
+# `slow*` hang in wineboot, and spam.exe floods its output.
 FAKE_RUNNER = """#!/usr/bin/env bash
 root="{root}"
 drive=main
@@ -34,6 +37,8 @@ while [ $# -gt 0 ]; do
 done
 if [ "$1" = "--version" ]; then echo wine-11.0; exit 0; fi
 if [ "$drive" = "broken" ]; then echo "boom"; exit 1; fi
+case "$drive" in slow*) [ "$1" = "wineboot" ] && {{ echo "hanging"; sleep 60; }} ;; esac
+case "$*" in *spam.exe*) seq 1 20000; exit 0 ;; esac
 if [ "$server" = 0 ] && [ "$1" = "wineboot" ]; then
   mkdir -p "$root/drives/$drive/prefix"
   echo "WINE REGISTRY Version 2" > "$root/drives/$drive/prefix/system.reg"
@@ -185,6 +190,9 @@ class ApiTests(unittest.TestCase):
         # disk decide the outcome.
         cls._reserve = launcher.UPLOAD_RESERVE
         launcher.UPLOAD_RESERVE = 0
+        # A hung wineboot is given up on after INIT_TIMEOUT; keep that short.
+        cls._init_timeout = launcher.INIT_TIMEOUT
+        launcher.INIT_TIMEOUT = 2
         cls.tmp = tempfile.mkdtemp(prefix="umbrel-wine-test-")
         root = Path(cls.tmp) / "config"
         (root / "drives" / "broken").mkdir(parents=True)
@@ -210,6 +218,7 @@ class ApiTests(unittest.TestCase):
         cls.server.server_close()
         shutil.rmtree(cls.tmp, ignore_errors=True)
         launcher.UPLOAD_RESERVE = cls._reserve
+        launcher.INIT_TIMEOUT = cls._init_timeout
 
     @classmethod
     def request(cls, method, path, body=None, headers=None):
@@ -486,6 +495,145 @@ class ApiTests(unittest.TestCase):
     def test_unknown_run(self):
         status, body = self.request("POST", "/api/runs/nope/stop")
         self.assertEqual((status, body["error"]), (404, "no_such_run"))
+
+    # -- folder uploads as one archive -----------------------------------------
+
+    @staticmethod
+    def make_tar(files: dict, dirs=(), extra=None) -> bytes:
+        buf = BytesIO()
+        with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for d in dirs:
+                info = tarfile.TarInfo(d)
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            for name, data in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, BytesIO(data))
+            if extra:
+                tar.addfile(extra)
+        return buf.getvalue()
+
+    def leftovers(self):
+        return [p.name for p in self.files_dir().iterdir() if p.name.startswith(".upload-")]
+
+    def test_folder_archive_upload_and_replace(self):
+        base = "/api/drives/main/folders/Arch"
+        body = self.make_tar({"bin/app.exe": b"MZapp", "data/Über level.pak": b"lvl"}, dirs=["saves"])
+        status, resp = self.request("PUT", base, body)
+        self.assertEqual((status, resp), (201, {"name": "Arch", "files": 2, "size": 8}))
+        folder = self.files_dir() / "Arch"
+        self.assertEqual((folder / "bin/app.exe").read_bytes(), b"MZapp")
+        self.assertTrue((folder / "saves").is_dir())  # empty folders survive
+        game = next(f for f in self.drive("main")["folders"] if f["name"] == "Arch")
+        self.assertEqual(game["executables"], ["Arch/bin/app.exe"])
+
+        status, resp = self.request("PUT", base, self.make_tar({"new.exe": b"MZnew"}))
+        self.assertEqual((status, resp["error"]), (409, "exists"))
+        self.assertTrue((folder / "bin/app.exe").exists())
+        status, _ = self.request("PUT", base + "?replace=1", self.make_tar({"new.exe": b"MZnew"}))
+        self.assertEqual(status, 201)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["new.exe"])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_cancelled_folder_upload_keeps_existing_folder(self):
+        import socket
+        base = "/api/drives/main/folders/Keep"
+        self.request("PUT", base, self.make_tar({"old.exe": b"MZold"}))
+        body = self.make_tar({f"f{i}.bin": os.urandom(4096) for i in range(200)})
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
+            s.sendall(f"PUT {base}?replace=1 HTTP/1.1\r\nHost: t\r\nContent-Length: {len(body)}\r\n\r\n".encode())
+            s.sendall(body[: len(body) // 2])  # then the user hits Cancel
+        # Give the server time to pick the request up and see it end early;
+        # polling at once could pass before the staging folder even exists.
+        time.sleep(0.5)
+        deadline = time.time() + 5
+        while self.leftovers() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(sorted(p.name for p in (self.files_dir() / "Keep").iterdir()), ["old.exe"])
+
+    def test_folder_archive_rejects_unsafe_members(self):
+        link = tarfile.TarInfo("evil")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc"
+        cases = {
+            "traversal": (self.make_tar({"../escape.txt": b"x"}), 400),
+            "symlink": (self.make_tar({"ok.txt": b"x"}, extra=link), 400),
+            "fake exe": (self.make_tar({"ok.txt": b"x", "bin/tool.exe": b"#!/bin/sh"}), 415),
+            "not a tar": (b"this is not an archive" * 100, 400),
+        }
+        for label, (body, code) in cases.items():
+            status, _ = self.request("PUT", f"/api/drives/main/folders/Bad{code}", body)
+            self.assertEqual(status, code, label)
+            self.assertFalse((self.files_dir() / f"Bad{code}").exists(), label)
+        self.assertFalse((self.files_dir().parent / "escape.txt").exists())
+        self.assertEqual(self.leftovers(), [])
+
+    # -- logs, run history, setup ------------------------------------------------
+
+    def run_and_wait(self, file):
+        status, body = self.request("POST", "/api/drives/main/run", {"file": file})
+        self.assertEqual(status, 201)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            run = next((r for r in self.drive("main")["runs"] if r["id"] == body["id"]), None)
+            if run and not run["running"]:
+                return body["id"]
+            time.sleep(0.05)
+        raise AssertionError("run did not finish")
+
+    def test_chatty_program_log_is_capped_keeping_start_and_end(self):
+        saved = launcher.LOG_HEAD_BYTES, launcher.LOG_KEEP_BYTES
+        launcher.LOG_HEAD_BYTES, launcher.LOG_KEEP_BYTES = 1000, 3000
+        try:
+            self.request("PUT", "/api/drives/main/files/spam.exe", b"MZspam")
+            run_id = self.run_and_wait("spam.exe")
+            path = self.app.runs.get(run_id).log_path
+            time.sleep(0.2)  # let the pump flush its last chunk
+            data = path.read_bytes()
+        finally:
+            launcher.LOG_HEAD_BYTES, launcher.LOG_KEEP_BYTES = saved
+        full = "".join(f"{i}\n" for i in range(1, 20001)).encode()  # 108,894 bytes
+        self.assertLessEqual(len(data), 1000 + len(launcher.LOG_DROPPED_MARK) + 2 * 3000)
+        self.assertTrue(data.startswith(full[:1000]))
+        self.assertIn(launcher.LOG_DROPPED_MARK, data)
+        self.assertTrue(data.endswith(b"19999\n20000\n"))
+
+    def test_run_history_is_bounded_and_listed_logs_survive_pruning(self):
+        saved = launcher.MAX_FINISHED_RUNS, launcher.MAX_LOGS
+        launcher.MAX_FINISHED_RUNS, launcher.MAX_LOGS = 3, 1
+        try:
+            self.request("PUT", "/api/drives/main/files/quiet.exe", b"MZq")
+            for _ in range(6):
+                self.run_and_wait("quiet.exe")
+            runs = [r for r in self.drive("main")["runs"] if not r["running"]]
+            self.assertEqual(len(runs), 3)
+            for r in runs:  # every listed run still has its log
+                _, log = self.request("GET", f"/api/runs/{r['id']}/log")
+                self.assertIn(b"quiet.exe", log)
+        finally:
+            launcher.MAX_FINISHED_RUNS, launcher.MAX_LOGS = saved
+
+    def test_hung_setup_times_out_without_blocking_other_drives(self):
+        self.assertEqual(self.request("POST", "/api/drives", {"name": "slow1"})[0], 201)
+        self.assertEqual(self.request("POST", "/api/drives", {"name": "after-slow"})[0], 201)
+        self.wait_state("slow1", "initializing")
+        # Stopping programs mid-setup would kill wineboot; it is refused.
+        status, body = self.request("POST", "/api/drives/slow1/stop-all")
+        self.assertEqual((status, body["error"]), (409, "drive_not_ready"))
+        slow = self.wait_state("slow1", "error", timeout=15)
+        self.assertIn("did not finish", slow["error_message"])
+        self.wait_state("after-slow", "ready", timeout=15)
+        status, log = self.request("GET", "/api/drives/slow1/setup-log")
+        self.assertEqual((status, log.strip()), (200, b"hanging"))
+
+    def test_setup_log_of_failed_drive(self):
+        d = self.wait_state("broken", "error")
+        self.assertTrue(d["setup_log"])
+        status, log = self.request("GET", "/api/drives/broken/setup-log")
+        # wineboot's output; the fake runner prints it again for `wineserver -w`.
+        self.assertEqual((status, log.split(b"\n")[0]), (200, b"boom"))
 
 
 if __name__ == "__main__":

@@ -17,3 +17,14 @@ chown abc:abc \
   /config/.config/openbox \
   /config/.config/openbox/menu.xml \
   /config/.config/openbox/autostart
+
+# Selkies' own nginx server (3000, and 3001 with a self-signed cert) listens on
+# every interface by default, so any container on the Umbrel's Docker network
+# could drive the desktop without logging in. Only our :8080 server (conf.d,
+# which proxies to 127.0.0.1:3000) needs to be reachable. The base regenerates
+# this file on every boot (init-nginx, which init-selkies-config waits for),
+# so this runs every boot too; it is idempotent.
+sed -i -E \
+  -e '/^[[:space:]]*listen \[::\]:/d' \
+  -e 's/^([[:space:]]*)listen ([0-9]+)([ ;])/\1listen 127.0.0.1:\2\3/' \
+  /etc/nginx/sites-available/default

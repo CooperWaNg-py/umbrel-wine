@@ -23,6 +23,7 @@ import socket
 import stat
 import struct
 import subprocess
+import tarfile
 import threading
 import time
 import uuid
@@ -49,8 +50,21 @@ FOLDER_CACHE_TTL = 30
 MAIN_DRIVE = "main"
 CHUNK = 1024 * 1024
 UPLOAD_RESERVE = 512 * 1024 * 1024
+# Logs in /config/logs: at most MAX_LOGS files besides those still referenced
+# (listed runs, each drive's latest setup log). Each keeps its first
+# LOG_HEAD_BYTES and a rolling last LOG_KEEP_BYTES, so a chatty program can
+# never fill the Umbrel's disk: ~4 MiB per log, ~200 MiB in total.
 MAX_LOGS = 50
+LOG_HEAD_BYTES = 1024 * 1024
+LOG_KEEP_BYTES = 3 * 1024 * 1024
+LOG_DROPPED_MARK = b"\n[umbrel-wine: output dropped here to keep this log small]\n"
 LOG_TAIL = 64 * 1024
+# Finished runs kept in the Running list, per drive.
+MAX_FINISHED_RUNS = 20
+# `wineboot -i` normally takes under a minute natively and several minutes
+# under box64 on a Pi; past this it is hung, and would block the single init
+# worker (every other drive) forever.
+INIT_TIMEOUT = 30 * 60
 MAX_JSON_BODY = 64 * 1024
 # Drive file browser: text files up to this size open in the editor. The save
 # body is JSON, where escaping can grow the text several times over.
@@ -177,6 +191,47 @@ def summarize_folder(files: Path, name: str) -> dict:
                 exes.append(Path(dirpath, f).relative_to(files).as_posix())
     exes.sort(key=lambda r: (r.count("/"), r.casefold()))
     return {"size": size, "file_count": count, "executables": exes[:MAX_LISTED_EXES]}
+
+
+class ClientGone(Exception):
+    """The request body ended before Content-Length: the upload was cancelled."""
+
+
+def extract_folder_tar(fileobj, dest: Path) -> tuple[int, int]:
+    """Unpack a folder upload (a tar stream) into `dest`; (files, bytes).
+
+    Only relative paths that pass split_rel_path, plain files and directories
+    are accepted: no links, devices or sparse members, which a browser-built
+    archive never contains. Like single uploads, every .exe must start with MZ.
+    """
+    count = size = 0
+    with tarfile.open(fileobj=fileobj, mode="r|") as tar:
+        for member in tar:
+            parts = split_rel_path(member.name.rstrip("/"))
+            if parts is None:
+                raise ApiError(400, "invalid_name", f"Invalid path in the upload: {member.name!r}.")
+            path = dest.joinpath(*parts)
+            try:
+                if member.isdir():
+                    path.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile() or member.issparse():
+                    raise ApiError(400, "unsupported_entry", f"{member.name} is not a regular file or folder.")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                out = open(path, "xb")
+            except (FileExistsError, NotADirectoryError):
+                raise ApiError(400, "conflict", f"{member.name} appears twice or collides with another entry.")
+            with out:
+                src = tar.extractfile(member)
+                first = src.read(CHUNK)
+                if is_exe(parts[-1]) and first[:2] != b"MZ":
+                    raise ApiError(415, "not_a_windows_executable", f"{member.name} is not a Windows executable.")
+                while first:
+                    out.write(first)
+                    first = src.read(CHUNK)
+            count += 1
+            size += member.size
+    return count, size
 
 
 def split_browse_path(s) -> list[str] | None:
@@ -418,28 +473,130 @@ def sanitize_stem(label: str) -> str:
     return stem[:64] or "program"
 
 
-def new_log_path(logs: Path, drive: str, label: str) -> Path:
-    logs.mkdir(parents=True, exist_ok=True)
-    base = f"{drive}-{time.strftime('%Y%m%d-%H%M%S')}-{sanitize_stem(label)}"
-    path = logs / f"{base}.log"
-    n = 2
-    while path.exists():
-        path = logs / f"{base}-{n}.log"
-        n += 1
-    return path
+class CappedLog:
+    """Log file that keeps the first LOG_HEAD_BYTES and the last
+    LOG_KEEP_BYTES of what is written, with LOG_DROPPED_MARK between.
+
+    Compacts in place once LOG_KEEP_BYTES have accumulated past the cap, so
+    the work stays linear in the output size. Several processes may share one
+    log (wineboot, then `wineserver -w`); it closes when the last releases it.
+    """
+
+    def __init__(self, fd: int):
+        self._fd = fd
+        self._lock = threading.Lock()
+        self._size = 0
+        self._refs = 1
+        self._broken = False
+        self._base = LOG_HEAD_BYTES + len(LOG_DROPPED_MARK)
+
+    def acquire(self) -> None:
+        with self._lock:
+            self._refs += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._refs -= 1
+            if self._refs == 0:
+                os.close(self._fd)
+
+    def write(self, data: bytes) -> None:
+        with self._lock:
+            if self._broken:
+                return
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(self._fd, view):]
+                self._size += len(data)
+                if self._size > self._base + 2 * LOG_KEEP_BYTES:
+                    tail = os.pread(self._fd, LOG_KEEP_BYTES, self._size - LOG_KEEP_BYTES)
+                    os.pwrite(self._fd, LOG_DROPPED_MARK, LOG_HEAD_BYTES)
+                    os.pwrite(self._fd, tail, self._base)
+                    self._size = self._base + len(tail)
+                    os.ftruncate(self._fd, self._size)
+                    os.lseek(self._fd, 0, os.SEEK_END)
+            except OSError:
+                # e.g. disk full: stop logging, but the pump keeps draining so
+                # the program never blocks on a full pipe.
+                self._broken = True
 
 
-def prune_logs(logs: Path, keep: int = MAX_LOGS) -> None:
+def _pump(pipe, log: CappedLog) -> None:
     try:
-        entries = [p for p in logs.iterdir() if p.is_file()]
+        while chunk := os.read(pipe.fileno(), 65536):
+            log.write(chunk)
+    finally:
+        pipe.close()
+        log.release()
+
+
+def spawn_logged(argv: list[str], cwd, log: CappedLog) -> subprocess.Popen:
+    """Start argv in its own session with stdout+stderr pumped into `log`.
+
+    Output reaches the log through a pipe rather than a file descriptor so it
+    can be capped. Children that inherit the pipe (wineserver) keep feeding
+    the same capped log for as long as they live.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    log.acquire()
+    threading.Thread(target=_pump, args=(proc.stdout, log), daemon=True).start()
+    return proc
+
+
+def read_tail(path: Path | None) -> bytes:
+    if path is None:
+        return b""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - LOG_TAIL))
+            return f.read()
     except FileNotFoundError:
-        return
-    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in entries[keep:]:
+        return b""
+
+
+class LogStore:
+    """Creates and prunes the log files in /config/logs."""
+
+    def __init__(self, logs: Path, protected):
+        self.logs = logs
+        self._protected = protected  # () -> set of paths still referenced
+
+    def create(self, drive: str, label: str) -> tuple[Path, CappedLog]:
+        """A new, exclusively created log. The caller holds one reference."""
+        self.logs.mkdir(parents=True, exist_ok=True)
+        base = f"{drive}-{time.strftime('%Y%m%d-%H%M%S')}-{sanitize_stem(label)}"
+        n = 1
+        while True:
+            path = self.logs / (f"{base}.log" if n == 1 else f"{base}-{n}.log")
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                n += 1  # same drive, label and second as another run
+                continue
+            return path, CappedLog(fd)
+
+    def prune(self) -> None:
+        """Keep the newest MAX_LOGS unreferenced logs; never touch referenced ones."""
+        protected = self._protected()
+        entries = []
         try:
-            old.unlink()
+            for p in self.logs.iterdir():
+                if p in protected:
+                    continue
+                try:
+                    entries.append((p.stat().st_mtime, p))
+                except FileNotFoundError:
+                    pass  # deleted meanwhile
         except FileNotFoundError:
-            pass
+            return
+        entries.sort(reverse=True)
+        for _mtime, old in entries[MAX_LOGS:]:
+            old.unlink(missing_ok=True)
 
 
 def kill_group(pid: int, sig: int) -> None:
@@ -493,11 +650,13 @@ class DriveManager:
     """Drive lifecycle. Prefixes are initialised by ONE worker thread, one
     drive at a time: parallel wineboot on a Raspberry Pi is very slow."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, logs: LogStore):
         self.cfg = cfg
+        self.logs = logs
         self._lock = threading.Lock()
-        # name -> {"state", "error_message", "gen"}; gen invalidates queued or
-        # in-flight inits when a drive is reset or deleted.
+        # name -> {"state", "error_message", "gen", "log"}; gen invalidates
+        # queued or in-flight inits when a drive is reset or deleted; log is
+        # the drive's latest setup log.
         self._drives: dict[str, dict] = {}
         self._queue: queue.Queue = queue.Queue()
         self._init_proc: tuple[str, subprocess.Popen] | None = None
@@ -527,10 +686,15 @@ class DriveManager:
                 continue
             (d / "files").mkdir(exist_ok=True)
             (d / "prefix").mkdir(exist_ok=True)
-            for part in (d / "files").glob(".upload-*.part"):
-                part.unlink(missing_ok=True)
+            # Leftovers of interrupted uploads: .part files, extraction dirs
+            # and folders that were being replaced.
+            for leftover in (d / "files").glob(".upload-*"):
+                if leftover.is_dir() and not leftover.is_symlink():
+                    shutil.rmtree(leftover, ignore_errors=True)
+                else:
+                    leftover.unlink(missing_ok=True)
             with self._lock:
-                self._drives[d.name] = {"state": "ready", "error_message": None, "gen": 0}
+                self._drives[d.name] = {"state": "ready", "error_message": None, "gen": 0, "log": None}
                 if not (d / "prefix" / "system.reg").exists():
                     self._enqueue_locked(d.name)
 
@@ -538,6 +702,17 @@ class DriveManager:
         threading.Thread(target=self._worker, name="drive-init", daemon=True).start()
 
     # -- queries -------------------------------------------------------------
+
+    def log_paths(self) -> set[Path]:
+        with self._lock:
+            return {d["log"] for d in self._drives.values() if d["log"]}
+
+    def setup_log(self, name: str) -> Path | None:
+        with self._lock:
+            d = self._drives.get(name)
+            if d is None:
+                raise ApiError(404, "no_such_drive", f"No drive named {name!r}.")
+            return d["log"]
 
     def names(self) -> list[str]:
         with self._lock:
@@ -567,7 +742,7 @@ class DriveManager:
                 raise ApiError(409, "exists", f"Drive {name!r} already exists.")
             self.files_dir(name).mkdir(parents=True)
             self.prefix(name).mkdir(parents=True)
-            self._drives[name] = {"state": "initializing", "error_message": None, "gen": 0}
+            self._drives[name] = {"state": "initializing", "error_message": None, "gen": 0, "log": None}
             self._enqueue_locked(name)
         return 201, {"name": name}
 
@@ -654,18 +829,19 @@ class DriveManager:
                         d["state"] = "error"
                         d["error_message"] = f"initialisation failed: {e}"
 
-    def _run_init(self, name: str, argv: list[str], log, timeout=None) -> int:
-        proc = subprocess.Popen(
-            [self.cfg.runner, "--drive", name, *argv],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    def _run_init(self, name: str, argv: list[str], log: CappedLog, timeout: float,
+                  kill_on_timeout: bool = False) -> int | None:
+        """Exit code, or None if it was still running after `timeout`."""
+        proc = spawn_logged([self.cfg.runner, "--drive", name, *argv], None, log)
         with self._lock:
             self._init_proc = (name, proc)
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return -1
+            if kill_on_timeout:
+                kill_group(proc.pid, signal.SIGKILL)
+                proc.wait()
+            return None
         finally:
             with self._lock:
                 self._init_proc = None
@@ -673,13 +849,23 @@ class DriveManager:
     def _init_drive(self, name: str, gen: int) -> None:
         if self.cfg.wait_x:
             self._wait_for_x()
-        log_path = new_log_path(self.cfg.logs, name, "wineboot")
-        prune_logs(self.cfg.logs)
-        with open(log_path, "ab") as log:
-            code = self._run_init(name, ["wineboot", "-i"], log)
-            if self._current(name, gen):
+        log_path, log = self.logs.create(name, "wineboot")
+        with self._lock:
+            d = self._drives.get(name)
+            if d is not None:
+                d["log"] = log_path
+        self.logs.prune()
+        try:
+            # A hung wineboot is killed rather than left to hold the single
+            # worker, which would stop every other drive from being prepared.
+            code = self._run_init(name, ["wineboot", "-i"], log, INIT_TIMEOUT, kill_on_timeout=True)
+            if code is None:
+                self.kill_server(name)  # helpers wineboot started under wineserver
+            elif self._current(name, gen):
                 self._run_init(name, ["--server", "-w"], log, timeout=FLUSH_TIMEOUT)
-        ok = (self.prefix(name) / "system.reg").exists()
+        finally:
+            log.release()
+        ok = code is not None and (self.prefix(name) / "system.reg").exists()
         with self._lock:
             d = self._drives.get(name)
             if d is None or d["gen"] != gen:
@@ -687,9 +873,15 @@ class DriveManager:
             if ok:
                 d["state"] = "ready"
                 d["error_message"] = None
+            elif code is None:
+                d["state"] = "error"
+                d["error_message"] = (
+                    f"wineboot did not finish within {INIT_TIMEOUT // 60} minutes; "
+                    "see the setup log, then Reset the drive to try again."
+                )
             else:
                 d["state"] = "error"
-                d["error_message"] = f"wineboot failed (exit {code}); see log {log_path.name}"
+                d["error_message"] = f"wineboot failed (exit {code}); see the setup log."
 
 
 # --------------------------------------------------------------------------
@@ -723,23 +915,22 @@ class RunManager:
     """Programs started from the UI. In memory only: lost when the launcher
     restarts, which is what "Stop all on this drive" (wineserver -k) covers."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, logs: LogStore):
         self.cfg = cfg
+        self.logs = logs
         self._lock = threading.Lock()
         self._runs: dict[str, Run] = {}
 
     def start(self, drive: str, argv_tail: list[str], cwd: Path, label: str) -> Run:
-        log_path = new_log_path(self.cfg.logs, drive, label)
-        with open(log_path, "ab") as log:
-            proc = subprocess.Popen(
-                [self.cfg.runner, "--drive", drive, *argv_tail],
-                cwd=cwd, stdin=subprocess.DEVNULL, stdout=log,
-                stderr=subprocess.STDOUT, start_new_session=True,
-            )
-        prune_logs(self.cfg.logs)
+        log_path, log = self.logs.create(drive, label)
+        try:
+            proc = spawn_logged([self.cfg.runner, "--drive", drive, *argv_tail], cwd, log)
+        finally:
+            log.release()
         run = Run(uuid.uuid4().hex[:12], drive, label, time.time(), proc, log_path)
         with self._lock:
             self._runs[run.id] = run
+        self.logs.prune()
         threading.Thread(target=self._wait, args=(run,), daemon=True).start()
         return run
 
@@ -748,6 +939,18 @@ class RunManager:
         with self._lock:
             run.exit_code = code
             run.ended = time.time()
+            # Keep every running program and the newest MAX_FINISHED_RUNS
+            # finished ones per drive; their logs stay protected from pruning.
+            finished = sorted(
+                (r for r in self._runs.values() if r.drive == run.drive and r.ended is not None),
+                key=lambda r: r.ended, reverse=True,
+            )
+            for old in finished[MAX_FINISHED_RUNS:]:
+                del self._runs[old.id]
+
+    def log_paths(self) -> set[Path]:
+        with self._lock:
+            return {r.log_path for r in self._runs.values()}
 
     def get(self, run_id: str) -> Run:
         with self._lock:
@@ -780,15 +983,7 @@ class RunManager:
         return 202, {"id": run.id}
 
     def log_tail(self, run_id: str) -> bytes:
-        run = self.get(run_id)
-        try:
-            with open(run.log_path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - LOG_TAIL))
-                return f.read()
-        except FileNotFoundError:
-            return b""
+        return read_tail(self.get(run_id).log_path)
 
 
 # --------------------------------------------------------------------------
@@ -799,8 +994,11 @@ class RunManager:
 class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.drives = DriveManager(cfg)
-        self.runs = RunManager(cfg)
+        # Logs referenced by a listed run or a drive's latest setup are never
+        # pruned; the lambda is only called after both managers exist.
+        self.logs = LogStore(cfg.logs, lambda: self.runs.log_paths() | self.drives.log_paths())
+        self.drives = DriveManager(cfg, self.logs)
+        self.runs = RunManager(cfg, self.logs)
         self.arch = os.uname().machine
         self.page_size = os.sysconf("SC_PAGE_SIZE")
         self.wine_version: str | None = None
@@ -892,6 +1090,7 @@ class App:
                 "name": name,
                 "state": info["state"],
                 "error_message": info["error_message"],
+                "setup_log": self.drives.setup_log(name) is not None,
                 "files": files,
                 "folders": folders,
                 "programs": scan_programs(self.drives.prefix(name)),
@@ -1081,6 +1280,8 @@ ROUTES = [
     (re.compile(r"^/api/drives/([^/]+)/run$"), {"POST": "post_run"}),
     # The file path may contain literal slashes or %2F (encodeURIComponent).
     (re.compile(r"^/api/drives/([^/]+)/files/(.+)$"), {"PUT": "put_file", "DELETE": "delete_file"}),
+    # A whole folder as one tar stream (the UI's folder upload).
+    (re.compile(r"^/api/drives/([^/]+)/folders/([^/]+)$"), {"PUT": "put_folder"}),
     # File browser: ?path= is relative to the drive (files/..., prefix/...).
     (re.compile(r"^/api/drives/([^/]+)/fs$"), {"DELETE": "delete_fs"}),
     (re.compile(r"^/api/drives/([^/]+)/fs/list$"), {"GET": "get_fs_list"}),
@@ -1089,6 +1290,7 @@ ROUTES = [
     (re.compile(r"^/api/drives/([^/]+)/fs/upload$"), {"PUT": "put_fs_upload"}),
     (re.compile(r"^/api/runs/([^/]+)/stop$"), {"POST": "post_run_stop"}),
     (re.compile(r"^/api/runs/([^/]+)/log$"), {"GET": "get_run_log"}),
+    (re.compile(r"^/api/drives/([^/]+)/setup-log$"), {"GET": "get_setup_log"}),
 ]
 
 
@@ -1100,6 +1302,14 @@ class Handler(BaseHTTPRequestHandler):
     app: App  # set by make_server
 
     # -- plumbing ------------------------------------------------------------
+
+    def handle(self):
+        # A client that goes away (cancelled upload, closed tab) resets the
+        # connection; that is not an error worth a traceback in the app log.
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
 
     def handle_expect_100(self):
         # Defer: put_file sends 100 Continue once its checks pass, so a
@@ -1217,7 +1427,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(*self.app.drives.reset(drive))
 
     def post_stop_all(self, drive):
-        self.app.drives.require(drive)
+        # `wineserver -k` during setup would kill wineboot and leave a failed
+        # or half-built prefix that only Reset recovers.
+        if self.app.drives.info(drive)["state"] == "initializing":
+            raise ApiError(409, "drive_not_ready", "This drive is still being prepared; wait for it to finish.")
         self.app.drives.kill_server(drive)
         self._send_json(202, {})
 
@@ -1230,7 +1443,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(*self.app.runs.stop(run_id))
 
     def get_run_log(self, run_id):
-        body = self.app.runs.log_tail(run_id)
+        self._send_log(self.app.runs.log_tail(run_id))
+
+    def get_setup_log(self, drive):
+        self._send_log(read_tail(self.app.drives.setup_log(drive)))
+
+    def _send_log(self, body: bytes):
         text = body.decode("utf-8", errors="replace").encode("utf-8")
         self._send_body(200, text, "text/plain; charset=utf-8", extra={"Cache-Control": "no-cache"})
 
@@ -1258,6 +1476,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def put_fs_upload(self, drive):
         self._guarded_upload(self._receive_fs_upload, drive)
+
+    def put_folder(self, drive, name):
+        self._guarded_upload(self._receive_folder, drive, name)
 
     def _guarded_upload(self, receive, *args):
         self._upload_left = None  # body bytes still unread; None = unknown
@@ -1296,6 +1517,81 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if left is not None:
                 left -= len(data)
+
+    def _read_body(self, n: int) -> bytes:
+        """Up to n bytes of the declared body; ClientGone if it ends early."""
+        n = min(n, self._upload_left)
+        if n <= 0:
+            return b""
+        data = self.rfile.read(n)
+        if not data:
+            raise ClientGone()
+        self._upload_left -= len(data)
+        return data
+
+    def _receive_folder(self, drive, name):
+        """A whole folder as one tar stream, built by the browser.
+
+        One request instead of one per file: thousands of small files are no
+        longer bound by per-request overhead through the Umbrel gateway, the
+        browser shows one exact progress bar, and a single abort cancels it.
+        The archive is unpacked into a hidden staging folder and swapped in
+        only once complete, so a failed, cancelled or interrupted upload never
+        touches an existing folder and never leaves a partial one behind.
+        """
+        self.close_connection = True
+        self.app.drives.require(drive)
+        parts = split_rel_path(name)
+        if parts is None or len(parts) != 1:
+            raise ApiError(400, "invalid_name", "Invalid folder name.")
+        total = self._upload_length()
+        files = self.app.drives.files_dir(drive)
+        target = files / name
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise ApiError(409, "exists", f"{name} already exists on this drive and is not a folder.")
+        if target.exists() and self._q("replace") != "1":
+            raise ApiError(409, "exists", f"Folder {name} already exists on this drive.")
+        if self.headers.get("Expect", "").lower() == "100-continue":
+            self.send_response_only(100)
+            self.end_headers()
+
+        handler = self
+
+        class Body:
+            def read(self, n=-1):
+                return handler._read_body(handler._upload_left if n is None or n < 0 else n)
+
+        staging = files / f".upload-{uuid.uuid4().hex}.dir"
+        staging.mkdir()
+        swapped = False
+        try:
+            try:
+                count, size = extract_folder_tar(Body(), staging)
+                while self._read_body(CHUNK):  # tar end padding
+                    pass
+            except ClientGone:
+                return  # cancelled: nobody is listening for a response
+            except tarfile.TarError as e:
+                raise ApiError(400, "bad_archive", f"The upload is not a valid folder archive ({e}).")
+            old = None
+            if target.exists():
+                old = files / f".upload-{uuid.uuid4().hex}.old"
+                os.rename(target, old)
+            try:
+                os.rename(staging, target)
+                swapped = True
+            finally:
+                if old is not None:
+                    if swapped:
+                        shutil.rmtree(old, ignore_errors=True)
+                    else:
+                        os.rename(old, target)
+        finally:
+            if not swapped:
+                shutil.rmtree(staging, ignore_errors=True)
+        self.app.invalidate_folder(drive, name)
+        self.close_connection = False
+        self._send_json(201, {"name": name, "files": count, "size": size})
 
     def _upload_length(self) -> int:
         """Content-Length of an upload, checked against free space."""

@@ -1,0 +1,10 @@
+# The base image is pinned by index digest (image/Dockerfile), so LinuxServer's
+# weekly rebuilds -- Selkies, nginx and Debian security fixes -- never arrive
+# on their own. Dependabot opens a PR when the pinned digest has a newer
+# rebuild; merging it rebuilds and republishes the image through CI.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /image
+    schedule:
+      interval: weekly

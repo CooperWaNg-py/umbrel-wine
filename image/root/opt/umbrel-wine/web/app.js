@@ -20,6 +20,7 @@ function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
     if (k === "class") node.className = v;
+    else if (k === "key") node.dataset.key = v; // identifies the control across re-renders
     else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
     else if (v !== undefined && v !== null && v !== false) node[k] = v;
   }
@@ -99,13 +100,19 @@ function renderDriveBar() {
   $("drive-delete").hidden = current === "main";
 
   const note = $("drive-note");
+  const setupLog = () => el("button", {
+    class: "link", key: `setup-log:${d.name}`, textContent: "Setup log",
+    onclick: () => openLog(driveUrl(d.name, "/setup-log"), `Setup log: ${d.name}`),
+  });
   if (d && d.state === "initializing") {
     note.className = "note";
-    note.textContent = "Preparing drive… this can take several minutes on a Raspberry Pi";
+    note.replaceChildren("Preparing drive… this can take several minutes on a Raspberry Pi. ",
+      ...(d.setup_log ? [setupLog()] : []));
     note.hidden = false;
   } else if (d && d.state === "error") {
     note.className = "error";
-    note.textContent = d.error_message || "This drive failed to initialise.";
+    note.replaceChildren(`${d.error_message || "This drive failed to initialise."} `,
+      ...(d.setup_log ? [setupLog()] : []));
     note.hidden = false;
   } else {
     note.hidden = true;
@@ -119,8 +126,8 @@ function renderFiles(d) {
     rows.push(el("li", {},
       el("span", { class: "name", title: f.name, textContent: f.name }),
       el("span", { class: "size", textContent: humanSize(f.size) }),
-      el("button", { class: "primary", textContent: "Run", disabled: !ready, onclick: () => run({ file: f.name }) }),
-      el("button", { class: "danger", textContent: "Delete", onclick: () => deleteFile(f.name, false) }),
+      el("button", { class: "primary", key: `run:${f.name}`, textContent: "Run", disabled: !ready, onclick: () => run({ file: f.name }) }),
+      el("button", { class: "danger", key: `del:${f.name}`, textContent: "Delete", onclick: () => deleteFile(f.name, false) }),
     ));
   }
   // Folders list the .exe files inside; each runs in its own directory.
@@ -128,14 +135,14 @@ function renderFiles(d) {
     rows.push(el("li", { class: "folder" },
       el("span", { class: "name", title: f.name, textContent: `📁 ${f.name}` }),
       el("span", { class: "size", textContent: `${f.file_count} files · ${humanSize(f.size)}` }),
-      el("button", { textContent: "Browse", onclick: () => openBrowser(`files/${f.name}`) }),
-      el("button", { class: "danger", textContent: "Delete", onclick: () => deleteFile(f.name, true) }),
+      el("button", { key: `browse:${f.name}`, textContent: "Browse", onclick: () => openBrowser(`files/${f.name}`) }),
+      el("button", { class: "danger", key: `delfolder:${f.name}`, textContent: "Delete", onclick: () => deleteFile(f.name, true) }),
     ));
     if (!f.executables.length) rows.push(el("li", { class: "sub empty" }, "No .exe in this folder."));
     for (const exe of f.executables) {
       rows.push(el("li", { class: "sub" },
         el("span", { class: "name", title: exe, textContent: exe.slice(f.name.length + 1) }),
-        el("button", { class: "primary", textContent: "Run", disabled: !ready, onclick: () => run({ file: exe }) }),
+        el("button", { class: "primary", key: `run:${exe}`, textContent: "Run", disabled: !ready, onclick: () => run({ file: exe }) }),
       ));
     }
   }
@@ -152,7 +159,7 @@ function renderPrograms(d) {
   }
   list.replaceChildren(...d.programs.map((p) => el("li", {},
     el("span", { class: "name", title: p.path, textContent: p.name }),
-    el("button", { class: "primary", textContent: "Run", disabled: !ready, onclick: () => run({ program: p.path }) }),
+    el("button", { class: "primary", key: `prog:${p.path}`, textContent: "Run", disabled: !ready, onclick: () => run({ program: p.path }) }),
   )));
 }
 
@@ -167,19 +174,34 @@ function renderRuns(d) {
     r.running
       ? el("span", { class: "badge running", textContent: "running" })
       : el("span", { class: "badge", textContent: `exited ${r.exit_code}` }),
-    el("button", { textContent: "Stop", disabled: !r.running, onclick: () => stopRun(r.id) }),
-    el("button", { textContent: "Log", onclick: () => openLog(r) }),
+    el("button", { key: `stop:${r.id}`, textContent: "Stop", disabled: !r.running, onclick: () => stopRun(r.id) }),
+    el("button", { key: `log:${r.id}`, textContent: "Log", onclick: () => openLog(`api/runs/${encodeURIComponent(r.id)}/log`, `Log: ${r.label}`) }),
   )));
 }
 
+let lastRendered = "";
+
 function render() {
   if (!drives.some((d) => d.name === current)) current = "main";
+  // The poll returns the same data most of the time; rebuilding the lists
+  // anyway would drop keyboard focus and swallow clicks every 2 s.
+  const snapshot = JSON.stringify([current, drives]);
+  if (snapshot === lastRendered) return;
+  lastRendered = snapshot;
+  const focused = document.activeElement && document.activeElement.dataset
+    ? document.activeElement.dataset.key : undefined;
   renderDriveBar();
   const d = currentDrive();
   if (!d) return;
   renderFiles(d);
   renderPrograms(d);
   renderRuns(d);
+  // Stopping programs mid-setup would kill wineboot (the server refuses too).
+  $("stop-all").disabled = d.state !== "ready";
+  if (focused) {
+    const again = document.querySelector(`[data-key="${CSS.escape(focused)}"]`);
+    if (again) again.focus();
+  }
 }
 
 // ---------------------------------------------------------------- polling
@@ -270,12 +292,12 @@ $("stop-all").addEventListener("click", async () => {
 // ---------------------------------------------------------------- log modal
 
 let logTimer = null;
-let logRunId = null;
+let logUrl = null;
 
 async function loadLog() {
-  if (!logRunId) return;
+  if (!logUrl) return;
   try {
-    const res = await fetch(`api/runs/${encodeURIComponent(logRunId)}/log`);
+    const res = await fetch(logUrl);
     const text = await res.text();
     const pre = $("log-text");
     const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
@@ -292,9 +314,9 @@ async function loadLog() {
   }
 }
 
-function openLog(r) {
-  logRunId = r.id;
-  $("log-title").textContent = `Log: ${r.label}`;
+function openLog(url, title) {
+  logUrl = url;
+  $("log-title").textContent = title;
   $("log-text").textContent = "Loading…";
   $("log-dialog").showModal();
   loadLog();
@@ -305,15 +327,18 @@ function openLog(r) {
 $("log-close").addEventListener("click", () => $("log-dialog").close());
 $("log-dialog").addEventListener("close", () => {
   clearInterval(logTimer);
-  logRunId = null;
+  logUrl = null;
 });
 
 // ---------------------------------------------------------------- upload
 // A job is one loose .exe ({kind: "file", file}) or one folder ({kind:
-// "folder", name, entries: [{rel, file}]}) whose files keep their paths
-// below the drive's files/ ("Game/bin/game.exe").
+// "folder", name, entries}), each entry {rel, file} or {rel, dir: true} with
+// rel starting at the folder name. A folder goes up as ONE tar stream
+// (buildTar), which the server unpacks into a staging folder and swaps in
+// only when complete: thousands of small files are no longer slowed by
+// per-request overhead, and Cancel (or closing the tab) changes nothing.
 
-const FOLDER_PARALLEL = 3;
+const sidebarUpload = { xhr: null }; // in-flight request, for Cancel
 
 function showUploadError(msg) {
   const box = $("upload-error");
@@ -325,70 +350,130 @@ function filesUrl(drive, rel, overwrite = false) {
   return driveUrl(drive, `/files/${encodeURIComponent(rel)}`) + (overwrite ? "?overwrite=1" : "");
 }
 
-function xhrPut(url, file, onProgress) {
+// PUT `body`; `holder.xhr` is the live request while it runs, so it can be aborted.
+function xhrPut(url, body, label, onProgress, holder) {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
+    holder.xhr = xhr;
+    const done = (result) => {
+      if (holder.xhr === xhr) holder.xhr = null;
+      resolve(result);
+    };
     xhr.open("PUT", url);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded); };
     xhr.onload = () => {
       let data = null;
       try { data = JSON.parse(xhr.responseText); } catch { /* empty */ }
-      resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data });
+      done({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data });
     };
-    xhr.onerror = () => resolve({ ok: false, status: 0, data: { message: `Upload of ${file.name} failed (connection lost).` } });
-    xhr.send(file);
+    xhr.onerror = () => done({ ok: false, status: 0, data: { message: `Upload of ${label} failed (connection lost).` } });
+    xhr.onabort = () => done({ ok: false, status: 0, aborted: true, data: null });
+    xhr.send(body);
   });
 }
 
 function showProgress(label, loaded, total) {
   const pct = total ? Math.min(100, Math.floor((loaded / total) * 100)) : 100;
+  const queued = uploadQueue.length ? ` · ${uploadQueue.length} more queued` : "";
   $("upload").hidden = false;
   $("upload-name").textContent = label;
   $("upload-progress").value = pct;
   $("upload-text").textContent =
-    `${pct}% · ${(loaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`;
+    `${pct}% · ${(loaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB${queued}`;
+}
+
+// -- tar: POSIX ustar, plus pax records for names over 100 bytes or with
+// non-ASCII characters and for files over 8 GiB. The Blob only references
+// the files, so nothing is copied into memory.
+const utf8 = new TextEncoder();
+const TAR_MAX_OCTAL = 8 ** 11 - 1;
+
+function tarHeader(name, size, type, mtime) {
+  const h = new Uint8Array(512);
+  const put = (off, len, bytes) => h.set(bytes.subarray(0, len), off);
+  const oct = (off, len, n) => put(off, len - 1, utf8.encode(n.toString(8).padStart(len - 1, "0")));
+  put(0, 100, utf8.encode(name));
+  oct(100, 8, type === "5" ? 0o755 : 0o644);
+  oct(108, 8, 0);
+  oct(116, 8, 0);
+  oct(124, 12, size);
+  oct(136, 12, mtime);
+  h.fill(0x20, 148, 156); // checksum is computed with its own field as spaces
+  h[156] = type.charCodeAt(0);
+  put(257, 8, utf8.encode("ustar\u000000"));
+  let sum = 0;
+  for (const b of h) sum += b;
+  put(148, 8, utf8.encode(`${sum.toString(8).padStart(6, "0")}\u0000 `));
+  return h;
+}
+
+function paxRecord(key, value) {
+  // "<len> key=value\n", where len counts the whole record including itself.
+  const body = utf8.encode(` ${key}=${value}\n`);
+  let len = body.length;
+  for (;;) {
+    const next = String(len).length + body.length;
+    if (next === len) break;
+    len = next;
+  }
+  return [utf8.encode(String(len)), body];
+}
+
+const pad512 = (n) => new Uint8Array((512 - (n % 512)) % 512);
+
+function tarEntry(name, size, type, mtime) {
+  const parts = [];
+  const needPax = utf8.encode(name).length > 100 || /[^\x20-\x7e]/.test(name) || size > TAR_MAX_OCTAL;
+  if (needPax) {
+    const records = [...paxRecord("path", name), ...(size > TAR_MAX_OCTAL ? paxRecord("size", String(size)) : [])];
+    const len = records.reduce((sum, r) => sum + r.length, 0);
+    parts.push(tarHeader("PaxHeader", len, "x", mtime), ...records, pad512(len));
+  }
+  parts.push(tarHeader(needPax ? "pax-entry" : name, size > TAR_MAX_OCTAL ? 0 : size, type, mtime));
+  return parts;
+}
+
+function buildTar(entries) {
+  const parts = [];
+  const now = Math.floor(Date.now() / 1000);
+  for (const e of entries) {
+    if (e.dir) {
+      parts.push(...tarEntry(`${e.rel}/`, 0, "5", now));
+    } else {
+      const mtime = Math.floor((e.file.lastModified || Date.now()) / 1000);
+      parts.push(...tarEntry(e.rel, e.file.size, "0", mtime), e.file, pad512(e.file.size));
+    }
+  }
+  parts.push(new Uint8Array(1024)); // end-of-archive marker
+  return new Blob(parts);
 }
 
 async function uploadLoose(drive, file) {
-  const progress = (n) => showProgress(`${file.name} → ${drive}`, n, file.size);
-  progress(0);
-  let r = await xhrPut(filesUrl(drive, file.name), file, progress);
-  if (r.status === 409) {
-    if (!confirm(`${file.name} already exists on this drive. Replace it?`)) return;
-    r = await xhrPut(filesUrl(drive, file.name, true), file, progress);
-  }
-  if (!r.ok) showUploadError(errorMessage(r));
+  // Ask before sending, so replacing a large .exe does not upload it twice.
+  const d = drives.find((x) => x.name === drive);
+  const exists = Boolean(d && d.files.some((f) => f.name === file.name));
+  if (exists && !confirm(`${file.name} already exists on this drive. Replace it?`)) return;
+  const label = `${file.name} → ${drive}`;
+  showProgress(label, 0, file.size);
+  const r = await xhrPut(filesUrl(drive, file.name, exists), file, file.name,
+    (n) => showProgress(label, n, file.size), sidebarUpload);
+  if (!r.ok && !r.aborted) showUploadError(errorMessage(r));
 }
 
 async function uploadFolder(drive, name, entries) {
   const d = drives.find((x) => x.name === drive);
-  if (d && d.folders.some((f) => f.name === name)) {
-    if (!confirm(`Folder ${name} already exists on this drive. Replace it? The existing folder is deleted first.`)) return;
-    const r = await api("DELETE", filesUrl(drive, name));
-    if (!r.ok && r.status !== 404) { showUploadError(errorMessage(r)); return; }
-  }
-  const total = entries.reduce((sum, e) => sum + e.file.size, 0);
-  const label = `${name}/ (${entries.length} files) → ${drive}`;
-  const inflight = new Map();
-  let doneBytes = 0;
-  let next = 0;
-  let failed = null;
-  const report = () => showProgress(label, doneBytes + [...inflight.values()].reduce((a, b) => a + b, 0), total);
-  // A few requests at once: folders are often thousands of small files.
-  async function worker() {
-    while (!failed && next < entries.length) {
-      const { rel, file } = entries[next++];
-      inflight.set(rel, 0);
-      const r = await xhrPut(filesUrl(drive, rel), file, (n) => { inflight.set(rel, n); report(); });
-      inflight.delete(rel);
-      if (!r.ok) { failed = failed || `${rel}: ${errorMessage(r)}`; return; }
-      doneBytes += file.size;
-      report();
-    }
-  }
-  report();
-  await Promise.all(Array.from({ length: Math.min(FOLDER_PARALLEL, entries.length) }, worker));
-  if (failed) showUploadError(`Upload of folder ${name} stopped. ${failed}`);
+  const exists = Boolean(d && d.folders.some((f) => f.name === name));
+  if (exists && !confirm(`Folder ${name} already exists on this drive. Replace it? ` +
+    "The current folder stays until the new one has uploaded completely.")) return;
+  const inner = entries
+    .filter((e) => e.rel !== name)
+    .map((e) => ({ ...e, rel: e.rel.slice(name.length + 1) }));
+  const tar = buildTar(inner);
+  const label = `${name}/ (${inner.filter((e) => !e.dir).length} files) → ${drive}`;
+  const url = driveUrl(drive, `/folders/${encodeURIComponent(name)}`) + (exists ? "?replace=1" : "");
+  showProgress(label, 0, tar.size);
+  const r = await xhrPut(url, tar, `folder ${name}`, (n) => showProgress(label, n, tar.size), sidebarUpload);
+  if (!r.ok && !r.aborted) showUploadError(`Upload of folder ${name} failed: ${errorMessage(r)}`);
 }
 
 async function drainUploads() {
@@ -406,6 +491,20 @@ async function drainUploads() {
     $("upload").hidden = true;
   }
 }
+
+function cancelUploads() {
+  const pending = uploadQueue.length + (sidebarUpload.xhr ? 1 : 0);
+  uploadQueue.length = 0;
+  if (sidebarUpload.xhr) sidebarUpload.xhr.abort();
+  if (pending) showUploadError("Upload cancelled. Nothing on the drive was changed by it.");
+}
+
+$("upload-cancel").addEventListener("click", cancelUploads);
+
+// Leaving mid-upload aborts it; ask first.
+window.addEventListener("beforeunload", (e) => {
+  if (uploading || browseUpload.xhr) { e.preventDefault(); e.returnValue = ""; }
+});
 
 // Hidden files (.DS_Store, .git, ...) are skipped; the server refuses them.
 const isHidden = (rel) => rel.split("/").some((p) => p.startsWith("."));
@@ -432,7 +531,10 @@ function folderJobs(entries) {
     if (!byFolder.has(top)) byFolder.set(top, []);
     byFolder.get(top).push(e);
   }
-  return [...byFolder].map(([name, list]) => ({ kind: "folder", name, entries: list }));
+  // A folder with nothing but (empty) subfolders is not worth uploading.
+  return [...byFolder]
+    .filter(([, list]) => list.some((e) => !e.dir))
+    .map(([name, list]) => ({ kind: "folder", name, entries: list }));
 }
 
 function enqueue(jobs) {
@@ -474,6 +576,7 @@ async function walkEntry(entry, prefix, out) {
   const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
   if (entry.isFile) out.push({ rel, file: await entryFile(entry) });
   else if (entry.isDirectory) {
+    out.push({ rel, dir: true }); // keeps empty folders a program may expect
     for (const child of await readAllEntries(entry.createReader())) await walkEntry(child, rel, out);
   }
 }
@@ -510,7 +613,7 @@ dz.addEventListener("drop", async (e) => {
 // Browses the drive's own directory: files/ (uploads) and prefix/ (the Wine
 // prefix: drive_c, registry files). Paths are relative to the drive.
 
-const browse = { drive: null, path: "", doc: null, dirty: false };
+const browse = { drive: null, path: "", names: new Set(), doc: null, dirty: false };
 const PROTECTED = new Set(["files", "prefix"]);
 const HINTS = {
   "": "files holds your uploads. prefix is the Wine environment: prefix/drive_c is the C: drive, and system.reg / user.reg are the registry.",
@@ -548,6 +651,7 @@ async function browseTo(path) {
     return;
   }
   browse.path = r.data.path;
+  browse.names = new Set(r.data.entries.map((e) => e.name));
   showEditor(false);
   renderCrumbs();
   renderEntries(r.data);
@@ -656,21 +760,30 @@ $("editor-close").addEventListener("click", async () => {
   if (discardOk()) await browseTo(browse.path);
 });
 
+const browseUpload = { xhr: null, cancelled: false };
+
 $("browse-upload-input").addEventListener("change", async (e) => {
   const files = [...e.target.files];
   e.target.value = "";
   const dir = browse.path;
-  for (const file of files) {
-    const url = (overwrite) => fsUrl(browse.drive, "/upload",
-      overwrite ? { path: dir, name: file.name, overwrite: "1" } : { path: dir, name: file.name });
-    const progress = (n) => setBrowseStatus(`Uploading ${file.name}: ${Math.floor((n / Math.max(file.size, 1)) * 100)}%`);
-    let r = await xhrPut(url(false), file, progress);
-    if (r.status === 409) {
-      if (!confirm(`${file.name} already exists in this folder. Replace it?`)) continue;
-      r = await xhrPut(url(true), file, progress);
+  browseUpload.cancelled = false;
+  $("browse-upload-cancel").hidden = false;
+  try {
+    for (const file of files) {
+      if (browseUpload.cancelled) break;
+      // Ask before sending, so a replaced file is not uploaded twice.
+      const exists = browse.names.has(file.name);
+      if (exists && !confirm(`${file.name} already exists in this folder. Replace it?`)) continue;
+      const params = { path: dir, name: file.name, ...(exists ? { overwrite: "1" } : {}) };
+      const r = await xhrPut(fsUrl(browse.drive, "/upload", params), file, file.name,
+        (n) => setBrowseStatus(`Uploading ${file.name}: ${Math.floor((n / Math.max(file.size, 1)) * 100)}%`),
+        browseUpload);
+      if (r.aborted) { setBrowseStatus("Upload cancelled; the file was not changed."); break; }
+      if (!r.ok) { setBrowseStatus(errorMessage(r), true); break; }
+      setBrowseStatus(`Uploaded ${file.name}.`);
     }
-    if (!r.ok) { setBrowseStatus(errorMessage(r), true); break; }
-    setBrowseStatus(`Uploaded ${file.name}.`);
+  } finally {
+    $("browse-upload-cancel").hidden = true;
   }
   if (browse.path === dir) {
     const status = $("browse-status").textContent;
@@ -681,9 +794,21 @@ $("browse-upload-input").addEventListener("change", async (e) => {
   if (dir.startsWith("files")) refresh();
 });
 
+function cancelBrowseUpload() {
+  browseUpload.cancelled = true;
+  if (browseUpload.xhr) browseUpload.xhr.abort();
+}
+
+$("browse-upload-cancel").addEventListener("click", cancelBrowseUpload);
+
+// Closing the dialog cancels an upload in progress (after asking), since its
+// Cancel button would no longer be reachable.
+const closeOk = () => discardOk() &&
+  (!browseUpload.xhr || (confirm("Cancel the upload in progress?") && (cancelBrowseUpload(), true)));
+
 $("drive-browse").addEventListener("click", () => openBrowser(""));
-$("browse-close").addEventListener("click", () => { if (discardOk()) $("browse-dialog").close(); });
-$("browse-dialog").addEventListener("cancel", (e) => { if (!discardOk()) e.preventDefault(); });
+$("browse-close").addEventListener("click", () => { if (closeOk()) $("browse-dialog").close(); });
+$("browse-dialog").addEventListener("cancel", (e) => { if (!closeOk()) e.preventDefault(); });
 $("browse-dialog").addEventListener("close", () => showEditor(false));
 
 // ---------------------------------------------------------------- sidebar

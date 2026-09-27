@@ -7,12 +7,12 @@
 #
 #   docker buildx build \
 #     --platform linux/amd64,linux/arm64 \
-#     -t ghcr.io/cooperwang-py/umbrel-wine:0.2.0 \
+#     -t ghcr.io/cooperwang-py/umbrel-wine:0.2.2 \
 #     --push image/
-#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.2.0
+#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.2.2
 #
 # Then copy the reported index digest into umbrel-wine-desktop/docker-compose.yml
-# as ghcr.io/cooperwang-py/umbrel-wine:0.2.0@sha256:<index-digest>.
+# as ghcr.io/cooperwang-py/umbrel-wine:0.2.2@sha256:<index-digest>.
 #
 # The base is pinned by its index digest too, from:
 #   docker buildx imagetools inspect ghcr.io/linuxserver/baseimage-selkies:debiantrixie
@@ -37,6 +37,11 @@ ARG GECKO64_SHA256=fd88fc7e537d058d7a8abf0c1ebc90c574892a466de86706a26d254710a82
 # Oldest acceptable box64 build: includes the 16K-page Wine mmap fix (box64
 # PR #4187) and the in-Docker wineserver path fix (#3813).
 ARG BOX64_MIN_DATE=20260926
+# The third-party box64 apt repo's signing key (Ryan Fortner). The key is
+# fetched at build time, so its fingerprint is checked before it is trusted:
+# a swapped key (compromised repo or hosting) fails the build instead of
+# silently signing whatever box64 binary ships next.
+ARG BOX64_KEY_FPR=DF9A1B8523C32EEEFF2A6CDA7759FA1D9FECAC9E
 
 # Baked in so the Umbrel package and tools/dev-stack.yml behave identically.
 # START_DOCKER: the base defaults to starting its bundled Docker daemon.
@@ -64,8 +69,11 @@ RUN set -eux; \
         libdbus-1-3 libsdl2-2.0-0 libunwind8 libcups2t64 libkrb5-3 \
         libgstreamer-plugins-base1.0-0; \
     if [ "$TARGETARCH" = "arm64" ]; then \
-        curl -fsSL https://ryanfortner.github.io/box64-debs/KEY.gpg \
-            | gpg --dearmor -o /etc/apt/trusted.gpg.d/box64-debs-archive-keyring.gpg; \
+        curl -fsSL -o /tmp/box64.gpg https://ryanfortner.github.io/box64-debs/KEY.gpg; \
+        fpr=$(gpg --show-keys --with-colons /tmp/box64.gpg | awk -F: '$1 == "fpr" { print $10; exit }'); \
+        [ "$fpr" = "$BOX64_KEY_FPR" ]; \
+        gpg --dearmor -o /etc/apt/trusted.gpg.d/box64-debs-archive-keyring.gpg /tmp/box64.gpg; \
+        rm /tmp/box64.gpg; \
         echo 'deb https://ryanfortner.github.io/box64-debs/debian ./' > /etc/apt/sources.list.d/box64.list; \
         apt-get update; \
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends box64; \
