@@ -9,7 +9,11 @@ manifestVersion: "2.0.0"
 id: umbrel-wine-desktop
 category: developer
 name: Wine
-version: "0.2.0"
+# umbrelOS decides whether to offer an update by comparing ONLY this version.
+# Bump it in the same commit as (or after) the new image digest in
+# docker-compose.yml, never before: a device that polls the store in between
+# installs the old image under the new version and is never offered it again.
+version: "0.2.1"
 tagline: Run Windows programs in your browser
 description: >-
   REQUIRES umbrelOS 2.0 AND OPENS OVER HTTPS. The desktop is streamed as video
@@ -58,6 +62,9 @@ path: ""
 submitter: CooperWaNg-py
 submission: https://github.com/CooperWaNg-py/umbrel-wine
 releaseNotes: >-
+  If you updated to 0.2.0 and nothing changed: 0.2.0 was briefly published
+  while still pointing at the 0.1.0 image. This update installs the real one.
+
   Upload whole folders: programs that need DLLs, data or config files next to
   their .exe can now be dropped or picked as a folder, and every .exe inside it
   can be run from the Files list. Each program starts in its own folder.
