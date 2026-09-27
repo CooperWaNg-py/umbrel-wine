@@ -20,7 +20,7 @@ services:
       APP_PORT: 8080
 
   wine:
-    image: ghcr.io/cooperwang-py/umbrel-wine:0.1.0@sha256:eeba7ebd8ac0e9186b51164bf9ef87486ab045c90c5a24f5ceb9244e3179b370
+    image: ghcr.io/cooperwang-py/umbrel-wine:0.2.0@sha256:0f37f876d8f6280c0b756b3cee4d3ba7de847c09688c628089242854b506912f
     restart: on-failure
     # LinuxServer's Selkies images document shm_size "1gb"; Docker's 64 MB
     # default is too small for the desktop session.
