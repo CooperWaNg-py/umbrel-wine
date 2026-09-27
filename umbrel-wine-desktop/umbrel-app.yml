@@ -13,7 +13,7 @@ name: Wine
 # Bump it in the same commit as (or after) the new image digest in
 # docker-compose.yml, never before: a device that polls the store in between
 # installs the old image under the new version and is never offered it again.
-version: "0.2.1"
+version: "0.2.2"
 tagline: Run Windows programs in your browser
 description: >-
   REQUIRES umbrelOS 2.0 AND OPENS OVER HTTPS. The desktop is streamed as video
@@ -59,21 +59,31 @@ gallery:
   - https://raw.githubusercontent.com/CooperWaNg-py/umbrel-wine/main/assets/gallery/1.jpg
   - https://raw.githubusercontent.com/CooperWaNg-py/umbrel-wine/main/assets/gallery/2.jpg
 path: ""
+# Left out of Umbrel backups: program logs and the desktop session's caches and
+# runtime files, all regenerated. Paths are relative to the app directory
+# (`data` is ${APP_DATA_DIR}/data, mounted at /config); drives are backed up.
+backupIgnore:
+  - data/logs
+  - data/.cache
+  - data/.XDG
 submitter: CooperWaNg-py
 submission: https://github.com/CooperWaNg-py/umbrel-wine
 releaseNotes: >-
-  If you updated to 0.2.0 and nothing changed: 0.2.0 was briefly published
-  while still pointing at the 0.1.0 image. This update installs the real one.
+  Faster, cancellable folder uploads: a folder now goes up as a single stream
+  instead of one request per file, so folders with thousands of small files
+  upload at the speed of your network. A Cancel button stops an upload, and a
+  cancelled, failed or interrupted upload never changes the drive: replacing
+  a folder keeps the old one until the new one has arrived completely.
 
-  Upload whole folders: programs that need DLLs, data or config files next to
-  their .exe can now be dropped or picked as a folder, and every .exe inside it
-  can be run from the Files list. Each program starts in its own folder.
+  Security: other apps' pages on your Umbrel can no longer send commands to
+  Wine or take over its desktop in the background, and the desktop stream's
+  internal ports are no longer open to other containers on the Umbrel.
 
-  Browse drive files: a file browser for each drive (uploads, the C: drive and
-  the registry files) with download, upload into any folder, delete, and a text
-  editor for configuration files. Files keep their original encoding and line
-  endings, and a save is refused if Wine changed the file while it was open.
+  Program logs are capped at about 4 MB each (start and end kept), so a
+  chatty program can no longer fill the Umbrel's disk. A drive whose setup
+  hangs now fails after 30 minutes instead of blocking every other drive,
+  and its setup log can be opened from the sidebar. "Stop all programs" is
+  disabled while a drive is being prepared, since it would break the setup.
 
-  Installed programs started from their shortcut are now tracked until they
-  exit, so Stop works on them, and crashing programs no longer leave large core
-  dump files in the drive.
+  The sidebar no longer resets keyboard focus every two seconds, and logs and
+  caches are left out of Umbrel backups.
