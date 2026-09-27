@@ -28,3 +28,19 @@ sed -i -E \
   -e '/^[[:space:]]*listen \[::\]:/d' \
   -e 's/^([[:space:]]*)listen ([0-9]+)([ ;])/\1listen 127.0.0.1:\2\3/' \
   /etc/nginx/sites-available/default
+
+# GPU: the manifest requests Umbrel's GPU permission, so umbrelOS mounts
+# /dev/dri when the host has one. On x86 (Umbrel Home: Intel) the base then
+# renders on the GPU (Xvfb with glamor/DRI3, so Wine gets hardware OpenGL) and
+# encodes the stream there with VA-API, zero copy. A Raspberry Pi's GPU has no
+# video encoder and GPU rendering under box64 is unproven, so arm64 stays on
+# the CPU path: the base would otherwise start Xvfb on the Pi's render node
+# (svc-xorg picks the first renderD* on any arch) and aim the encoder at it
+# (init-selkies-config sets DRI_NODE). Services read this environment when
+# they start, which is after this oneshot.
+if [ "$(uname -m)" = "aarch64" ]; then
+  printf "true" > /run/s6/container_environment/DISABLE_DRI3
+  printf "false" > /run/s6/container_environment/AUTO_GPU
+  printf -- "-1" > /run/s6/container_environment/SELKIES_GPU_ID
+  rm -f /run/s6/container_environment/DRI_NODE /run/s6/container_environment/DRINODE
+fi

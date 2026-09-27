@@ -7,12 +7,12 @@
 #
 #   docker buildx build \
 #     --platform linux/amd64,linux/arm64 \
-#     -t ghcr.io/cooperwang-py/umbrel-wine:0.2.2 \
+#     -t ghcr.io/cooperwang-py/umbrel-wine:0.2.3 \
 #     --push image/
-#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.2.2
+#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.2.3
 #
 # Then copy the reported index digest into umbrel-wine-desktop/docker-compose.yml
-# as ghcr.io/cooperwang-py/umbrel-wine:0.2.2@sha256:<index-digest>.
+# as ghcr.io/cooperwang-py/umbrel-wine:0.2.3@sha256:<index-digest>.
 #
 # The base is pinned by its index digest too, from:
 #   docker buildx imagetools inspect ghcr.io/linuxserver/baseimage-selkies:debiantrixie
@@ -49,13 +49,22 @@ ARG BOX64_KEY_FPR=DF9A1B8523C32EEEFF2A6CDA7759FA1D9FECAC9E
 #   passwordless sudo; left on, any uploaded binary would be root in here.
 # SELKIES_FILE_TRANSFERS: uploads go through the launcher; Selkies still offers
 #   downloads of files that programs produce.
+# SELKIES_USE_CSS_SCALING: size the remote desktop in CSS pixels instead of
+#   device pixels. With the base's HiDPI default a 2x screen made the session
+#   render and encode 4x the pixels (and Windows programs looked tiny at 96
+#   DPI). The HiDPI switch stays in the Selkies sidebar for sharper text.
+# SELKIES_ENCODER: the base's menu plus striped H.264, which encodes one stripe
+#   per CPU core and only the stripes that changed; it can beat full-frame
+#   H.264 on CPU-only hosts such as a Raspberry Pi. h264enc stays the default.
 ENV TITLE=Wine \
     SUBFOLDER=/desktop/ \
     PIXELFLUX_WAYLAND=false \
     START_DOCKER=false \
     DISABLE_SUDO=true \
     SELKIES_FILE_TRANSFERS=download \
-    FILE_MANAGER_PATH=/config/drives
+    FILE_MANAGER_PATH=/config/drives \
+    SELKIES_USE_CSS_SCALING=true \
+    SELKIES_ENCODER="h264enc,h264enc-striped,h265enc,vp8enc,vp9enc,av1enc,jpeg"
 
 # Native libraries Wine links on amd64 and box64 wraps on arm64.
 RUN set -eux; \

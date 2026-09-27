@@ -28,6 +28,10 @@ services:
     image: umbrel-wine:dev
     restart: unless-stopped
     shm_size: "1gb"
+    # On an x86 Linux host with an Intel/AMD GPU, mount it to get what Umbrel's
+    # GPU permission gives the packaged app (GPU rendering, VA-API encoding):
+    # devices:
+    #   - /dev/dri:/dev/dri
     ports:
       # Published directly because there is no app_proxy here. On umbrelOS the
       # proxy owns the host port and adds authentication; this is LAN-open.

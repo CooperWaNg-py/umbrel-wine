@@ -52,7 +52,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=0.2.2,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=0.2.3,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=sha,format=long
@@ -76,16 +76,16 @@ jobs:
         run: |
           echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ env.IMAGE }}:0.2.2@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ env.IMAGE }}:0.2.3@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          docker buildx imagetools inspect "${{ env.IMAGE }}:0.2.2" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${{ env.IMAGE }}:0.2.3" >> "$GITHUB_STEP_SUMMARY"
 
       # Fail loudly if the index somehow lacks a platform, rather than letting a
       # broken pull surface on the user's device.
       - name: Verify both platforms are present
         run: |
           set -euo pipefail
-          out="$(docker buildx imagetools inspect "${{ env.IMAGE }}:0.2.2" --raw)"
+          out="$(docker buildx imagetools inspect "${{ env.IMAGE }}:0.2.3" --raw)"
           for p in '"architecture":"amd64"' '"architecture":"arm64"'; do
             echo "$out" | tr -d ' \n' | grep -q "$p" || { echo "missing platform $p"; exit 1; }
           done
