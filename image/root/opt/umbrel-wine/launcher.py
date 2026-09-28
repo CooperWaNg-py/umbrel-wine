@@ -94,6 +94,7 @@ STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/icon.svg": ("icon.svg", "image/svg+xml"),
 }
 
 WARN_16K = (
@@ -724,7 +725,7 @@ class DriveManager:
             d = self._drives.get(name)
             if d is None:
                 raise ApiError(404, "no_such_drive", f"No drive named {name!r}.")
-            return {"state": d["state"], "error_message": d["error_message"]}
+            return {"state": d["state"], "error_message": d["error_message"], "setup_log": d["log"] is not None}
 
     def require(self, name: str) -> None:
         self.info(name)
@@ -982,9 +983,6 @@ class RunManager:
             threading.Thread(target=escalate, daemon=True).start()
         return 202, {"id": run.id}
 
-    def log_tail(self, run_id: str) -> bytes:
-        return read_tail(self.get(run_id).log_path)
-
 
 # --------------------------------------------------------------------------
 # Application
@@ -1078,24 +1076,26 @@ class App:
         folders.sort(key=lambda f: f["name"].casefold())
         return files, folders
 
-    def list_drives(self) -> list[dict]:
+    def list_drives(self, detail: str | None = None) -> list[dict]:
+        """Every drive's name and state; files, folders, programs and runs only
+        for `detail` (the drive the UI shows), so the 2 s poll does not walk
+        every drive's files and Start Menu."""
         result = []
         for name in self.drives.names():
             try:
                 info = self.drives.info(name)
             except ApiError:
                 continue  # deleted between names() and info()
-            files, folders = self.list_files(name)
-            result.append({
-                "name": name,
-                "state": info["state"],
-                "error_message": info["error_message"],
-                "setup_log": self.drives.setup_log(name) is not None,
-                "files": files,
-                "folders": folders,
-                "programs": scan_programs(self.drives.prefix(name)),
-                "runs": self.runs.for_drive(name),
-            })
+            entry = {"name": name, **info}
+            if name == detail:
+                files, folders = self.list_files(name)
+                entry.update(
+                    files=files,
+                    folders=folders,
+                    programs=scan_programs(self.drives.prefix(name)),
+                    runs=self.runs.for_drive(name),
+                )
+            result.append(entry)
         return result
 
     def delete_drive(self, name: str) -> tuple[int, None]:
@@ -1210,17 +1210,13 @@ class App:
         if not isinstance(body, dict) or not all(
             isinstance(body.get(k), t)
             for k, t in (("path", str), ("text", str), ("encoding", str), ("newline", str), ("mtime_ns", str))
-        ):
+        ) or not isinstance(body.get("force", False), bool):
             raise ApiError(400, "bad_request", "Expected path, text, encoding, newline and mtime_ns.")
         path = self.fs_file(drive, body["path"])
         st = path.stat()
-        if str(st.st_mtime_ns) != body["mtime_ns"]:
-            raise ApiError(
-                409, "changed",
-                "The file changed on disk since you opened it. Wine rewrites registry and "
-                "settings files while programs run: stop the drive's programs, reopen the "
-                "file and apply your edit again.",
-            )
+        # force: the user chose to overwrite a file that changed meanwhile.
+        if not body.get("force", False) and str(st.st_mtime_ns) != body["mtime_ns"]:
+            raise ApiError(409, "changed", "The file changed on disk since you opened it.")
         try:
             data = encode_text(body["text"], body["encoding"], body["newline"])
         except UnicodeEncodeError as e:
@@ -1263,6 +1259,13 @@ class App:
             raise ApiError(400, "not_a_directory", f"{'/'.join(parts)} is not a folder.")
         if not parts:
             raise ApiError(400, "invalid_path", "Upload into a folder inside files/ or prefix/.")
+        if parts[0] == "files" and validate_upload_path("/".join(parts[1:] + name_parts)) is None:
+            raise ApiError(
+                400, "invalid_name",
+                "Only .exe files can go directly into files/; put other files in a folder. "
+                "Names in files/ cannot start with a dot, end with a dot or space, or "
+                'contain <>:"\\|?*.',
+            )
         return parts + name_parts, folder.resolve() / name
 
 
@@ -1413,7 +1416,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, self.app.status())
 
     def get_drives(self):
-        self._send_json(200, self.app.list_drives())
+        self._send_json(200, self.app.list_drives(self._q("drive") or None))
 
     def post_drive(self):
         body = self._read_json()
@@ -1443,14 +1446,28 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(*self.app.runs.stop(run_id))
 
     def get_run_log(self, run_id):
-        self._send_log(self.app.runs.log_tail(run_id))
+        self._send_log(self.app.runs.get(run_id).log_path)
 
     def get_setup_log(self, drive):
-        self._send_log(read_tail(self.app.drives.setup_log(drive)))
+        self._send_log(self.app.drives.setup_log(drive))
 
-    def _send_log(self, body: bytes):
-        text = body.decode("utf-8", errors="replace").encode("utf-8")
-        self._send_body(200, text, "text/plain; charset=utf-8", extra={"Cache-Control": "no-cache"})
+    def _send_log(self, path: Path | None):
+        """The log's last LOG_TAIL bytes as text; with ?download=1, the whole
+        log (capped at ~4 MiB by CappedLog) as an attachment."""
+        if self._q("download") != "1":
+            text = read_tail(path).decode("utf-8", errors="replace").encode("utf-8")
+            self._send_body(200, text, "text/plain; charset=utf-8", extra={"Cache-Control": "no-cache"})
+            return
+        try:
+            data = path.read_bytes() if path is not None else None
+        except FileNotFoundError:
+            data = None
+        if data is None:
+            raise ApiError(404, "no_log", "This log does not exist (yet).")
+        self._send_body(200, data, "text/plain; charset=utf-8", extra={
+            "Cache-Control": "no-cache",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(path.name)}",
+        })
 
     def delete_file(self, drive, name):
         """Delete a loose .exe, a file inside a folder, or a whole folder."""
@@ -1677,7 +1694,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(201, {"name": name, "size": total})
 
     def _receive_fs_upload(self, drive):
-        """File-browser upload: any file into an existing folder of the drive."""
+        """File-browser upload: any file into an existing folder of the drive.
+        Inside files/ the sidebar's rules apply, so everything uploaded there
+        is listed and runnable: a loose file must be a .exe, and a .exe must
+        start with MZ."""
         self.close_connection = True
         name = self._q("name")
         parts, target = self.app.fs_upload_target(drive, self._q("path"), name)
@@ -1689,7 +1709,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(409, "exists", f"{name} already exists in this folder.")
         # The part file lives in files/ (same filesystem), where startup
         # cleans up leftovers.
-        if self._stream_upload(target, self.app.drives.files_dir(drive), name, total, check_mz=False):
+        check_mz = parts[0] == "files" and is_exe(name)
+        if self._stream_upload(target, self.app.drives.files_dir(drive), name, total, check_mz=check_mz):
             self.app.fs_changed(drive, parts)
             self.close_connection = False
             self._send_json(201, {"path": rel, "size": total})

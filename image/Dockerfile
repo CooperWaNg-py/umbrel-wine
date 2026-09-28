@@ -7,12 +7,12 @@
 #
 #   docker buildx build \
 #     --platform linux/amd64,linux/arm64 \
-#     -t ghcr.io/cooperwang-py/umbrel-wine:0.2.3 \
+#     -t ghcr.io/cooperwang-py/umbrel-wine:0.2.4 \
 #     --push image/
-#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.2.3
+#   docker buildx imagetools inspect ghcr.io/cooperwang-py/umbrel-wine:0.2.4
 #
 # Then copy the reported index digest into umbrel-wine-desktop/docker-compose.yml
-# as ghcr.io/cooperwang-py/umbrel-wine:0.2.3@sha256:<index-digest>.
+# as ghcr.io/cooperwang-py/umbrel-wine:0.2.4@sha256:<index-digest>.
 #
 # The base is pinned by its index digest too, from:
 #   docker buildx imagetools inspect ghcr.io/linuxserver/baseimage-selkies:debiantrixie

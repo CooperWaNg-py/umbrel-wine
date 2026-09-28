@@ -235,7 +235,8 @@ class ApiTests(unittest.TestCase):
 
     @classmethod
     def drive(cls, name):
-        _, drives = cls.request("GET", "/api/drives")
+        from urllib.parse import quote
+        _, drives = cls.request("GET", f"/api/drives?drive={quote(name)}")
         return next((d for d in drives if d["name"] == name), None)
 
     @classmethod
@@ -341,6 +342,12 @@ class ApiTests(unittest.TestCase):
         # Saving again from the stale copy is refused, e.g. after Wine rewrote the file.
         status, body = self.fs("PUT", "/text", {k: save[k] for k in ("path", "text", "encoding", "newline", "mtime_ns")})
         self.assertEqual((status, body["error"]), (409, "changed"))
+        # ...unless the user chose to overwrite it anyway.
+        forced = {k: save[k] for k in ("path", "encoding", "newline", "mtime_ns")}
+        status, _ = self.fs("PUT", "/text", {**forced, "text": "[forced]\n", "force": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(ini.read_bytes(), b"\xff\xfe" + "[forced]\r\n".encode("utf-16-le"))
+        saved = self.fs("GET", "/text", path="prefix/drive_c/windows/win.ini")[1]
         status, body = self.fs("PUT", "/text", {**{k: save[k] for k in ("path", "encoding", "newline")},
                                                "text": "\U0001F600", "mtime_ns": saved["mtime_ns"], "encoding": "cp1252"})
         self.assertEqual((status, body["error"]), (400, "unencodable"))
@@ -369,6 +376,37 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 204)
         status, body = self.fs("PUT", "/upload", b"x", path="", name="stray.txt")
         self.assertEqual((status, body["error"]), (400, "invalid_path"))
+
+    def test_browser_upload_into_files_follows_sidebar_rules(self):
+        # Everything in files/ must be listable and runnable from the sidebar.
+        for name, body, code in (
+            ("readme.txt", b"hi", "invalid_name"),        # loose, not a .exe
+            ("bad?.exe", b"MZ", "invalid_name"),          # Windows-illegal name
+            ("fake.exe", b"#!/bin/sh", "not_a_windows_executable"),
+        ):
+            status, resp = self.fs("PUT", "/upload", body, path="files", name=name)
+            self.assertEqual(resp["error"], code, name)
+            self.assertFalse((self.files_dir() / name).exists(), name)
+        self.request("PUT", "/api/drives/main/files/Tools%2Ftool.exe", b"MZt")
+        status, resp = self.fs("PUT", "/upload", b"notmz", path="files/Tools", name="helper.exe")
+        self.assertEqual((status, resp["error"]), (415, "not_a_windows_executable"))
+        status, _ = self.fs("PUT", "/upload", b"MZ", path="files", name="loose.exe")
+        self.assertEqual(status, 201)
+        self.assertIn("loose.exe", [f["name"] for f in self.drive("main")["files"]])
+        # prefix/ keeps no such rules: mods and configs go anywhere.
+        (self.root / "drives/main/prefix/drive_c").mkdir(parents=True, exist_ok=True)
+        status, _ = self.fs("PUT", "/upload", b"x", path="prefix/drive_c", name="notes?.exe")
+        self.assertEqual(status, 201)
+
+    def test_drive_list_details_only_for_requested_drive(self):
+        self.wait_state("broken", "error")
+        _, drives = self.request("GET", "/api/drives")
+        self.assertNotIn("files", next(d for d in drives if d["name"] == "main"))
+        _, drives = self.request("GET", "/api/drives?drive=main")
+        by_name = {d["name"]: d for d in drives}
+        self.assertLessEqual({"files", "folders", "programs", "runs"}, set(by_name["main"]))
+        self.assertNotIn("files", by_name["broken"])
+        self.assertEqual((by_name["broken"]["state"], by_name["broken"]["setup_log"]), ("error", True))
 
 
     def test_status(self):
@@ -599,6 +637,21 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(data.startswith(full[:1000]))
         self.assertIn(launcher.LOG_DROPPED_MARK, data)
         self.assertTrue(data.endswith(b"19999\n20000\n"))
+
+    def test_log_view_is_the_tail_and_download_the_whole_log(self):
+        self.request("PUT", "/api/drives/main/files/spam.exe", b"MZspam")
+        run_id = self.run_and_wait("spam.exe")
+        time.sleep(0.2)  # let the pump flush its last chunk
+        full = self.app.runs.get(run_id).log_path.read_bytes()
+        self.assertGreater(len(full), launcher.LOG_TAIL)
+        status, tail = self.request("GET", f"/api/runs/{run_id}/log")
+        self.assertEqual((status, tail), (200, full[-launcher.LOG_TAIL:]))
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", f"/api/runs/{run_id}/log?download=1")
+        resp = conn.getresponse()
+        self.assertEqual((resp.status, resp.read()), (200, full))
+        self.assertTrue(resp.getheader("Content-Disposition", "").startswith("attachment;"))
+        conn.close()
 
     def test_run_history_is_bounded_and_listed_logs_survive_pruning(self):
         saved = launcher.MAX_FINISHED_RUNS, launcher.MAX_LOGS

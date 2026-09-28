@@ -6,7 +6,9 @@
   --muted: #8b93a1;
   --accent: #8e2146;
   --accent-hi: #b02a58;
-  --danger: #c0392b;
+  --danger-text: #ff9b8f;
+  --error-bg: #5a1f1a;
+  --error-text: #ffb3a8;
   --warn-bg: #4a3b0b;
   --warn-text: #ffd866;
   color-scheme: dark;
@@ -22,7 +24,8 @@ html, body {
   font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
-#layout { display: flex; height: 100vh; width: 100vw; }
+/* dvh: 100vh includes the mobile browser's address bar and overflows. */
+#layout { position: relative; display: flex; height: 100vh; height: 100dvh; width: 100%; }
 
 #sidebar {
   width: 340px;
@@ -33,23 +36,29 @@ html, body {
   border-right: 1px solid var(--line);
   min-height: 0;
 }
-body.collapsed #sidebar { display: none; }
+/* Collapsed: a narrow rail with the toggle, so nothing covers the desktop. */
+body.collapsed #sidebar { width: auto; flex-basis: auto; }
+body.collapsed #sidebar-body,
+body.collapsed #sidebar .bar h1,
+body.collapsed #open-tab { display: none; }
+body.collapsed #sidebar .bar { padding: 10px 6px; }
 
 #sidebar-body { overflow-y: auto; padding: 0 14px 14px; }
 
 .bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; }
 .bar h1, .bar h2 { margin: 0; font-size: 16px; }
+#sidebar .bar h1 { flex: 1; }
 
 section { padding: 10px 0; border-bottom: 1px solid var(--line); }
 section:last-child { border-bottom: 0; }
-h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+section h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
 
 .row { display: flex; align-items: center; gap: 8px; }
-.row + .row { margin-top: 8px; }
-.buttons button, .buttons label.button { flex: 1; }
+.row + .row, form + .row { margin-top: 8px; }
+.buttons > button, .buttons > .button { flex: 1; }
 [hidden] { display: none !important; }
 
-button, select, label.button {
+button, select, input, .button {
   font: inherit;
   color: var(--text);
   background: #262a32;
@@ -58,27 +67,32 @@ button, select, label.button {
   padding: 5px 10px;
   cursor: pointer;
 }
-button:hover:not(:disabled) { background: #2f343e; }
+input[type="text"] { cursor: text; background: var(--bg); min-width: 0; }
+a.button { display: inline-block; text-align: center; text-decoration: none; }
+button:hover:not(:disabled), a.button:hover { background: #2f343e; }
 button:disabled { opacity: .45; cursor: default; }
-label.button { display: inline-block; text-align: center; border-radius: 6px; }
-label.button:hover { background: #2f343e; }
 button.primary { background: var(--accent); border-color: var(--accent); }
 button.primary:hover:not(:disabled) { background: var(--accent-hi); }
-button.danger { color: #ff9b8f; }
+button.danger { color: var(--danger-text); }
 button.wide { width: 100%; margin-top: 8px; }
-button.icon { padding: 2px 8px; font-size: 16px; }
+.icon { padding: 2px 8px; font-size: 16px; line-height: 1.4; }
 select { flex: 1; min-width: 0; }
+#drive-form { margin-top: 8px; }
+#drive-form-hint.error { color: var(--error-text); }
 
 .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #2f343e; white-space: nowrap; }
 .badge.ready { background: #1f4d2e; color: #9be3b0; }
 .badge.initializing { background: var(--warn-bg); color: var(--warn-text); }
-.badge.error { background: #5a1f1a; color: #ffb3a8; }
+.badge.error, .badge.failed { background: var(--error-bg); color: var(--error-text); }
 .badge.running { background: #1f3d5a; color: #a8d4ff; }
 
 .muted { color: var(--muted); font-size: 12px; }
 .note { margin-top: 8px; font-size: 12px; color: var(--warn-text); }
-.error { margin-top: 8px; font-size: 12px; color: #ffb3a8; }
+#drive-note.muted { margin-top: 8px; }
+.error { margin-top: 8px; font-size: 12px; color: var(--error-text); }
 .warning { margin-top: 8px; padding: 6px 8px; border-radius: 6px; background: var(--warn-bg); color: var(--warn-text); font-size: 12px; }
+#upload-error { align-items: flex-start; }
+#upload-error .icon { font-size: 12px; padding: 0 6px; }
 
 #dropzone {
   display: block;
@@ -107,17 +121,14 @@ select { flex: 1; min-width: 0; }
 button.link, button.crumb { background: none; border: 0; padding: 2px 4px; text-align: left; }
 button.link { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 button.link:hover:not(:disabled), button.crumb:hover:not(:disabled) { background: none; text-decoration: underline; }
+.list li button.more { color: var(--muted); font-size: 12px; padding: 0; }
 
 #main { position: relative; flex: 1; min-width: 0; display: flex; }
 #desktop { flex: 1; border: 0; width: 100%; height: 100%; background: #000; }
-#open-tab {
-  position: absolute; right: 10px; bottom: 8px;
-  font-size: 12px; color: var(--muted);
-  background: rgba(17, 19, 23, .75); padding: 2px 8px; border-radius: 6px;
-  text-decoration: none;
+#desktop-wait {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: #000; color: var(--muted);
 }
-#open-tab:hover { color: var(--text); }
-.floating { position: absolute; left: 8px; top: 8px; z-index: 2; background: rgba(38, 42, 50, .85); }
 
 dialog {
   width: min(900px, 90vw);
@@ -130,8 +141,10 @@ dialog {
 }
 dialog[open] { display: flex; flex-direction: column; }
 dialog::backdrop { background: rgba(0, 0, 0, .6); }
-dialog .bar { justify-content: space-between; border-bottom: 1px solid var(--line); }
+dialog .bar { border-bottom: 1px solid var(--line); }
+dialog .bar .button { font-size: 12px; padding: 3px 8px; }
 .dialog-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 10px 14px; }
+.dialog-body > .warning { margin-top: 0; }
 .toolbar { justify-content: space-between; }
 .crumbs { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; }
 .crumbs .sep { color: var(--muted); }
@@ -141,7 +154,7 @@ dialog .bar { justify-content: space-between; border-bottom: 1px solid var(--lin
   background: #111317; color: var(--text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 #browse-status { padding: 6px 14px; min-height: 28px; border-top: 1px solid var(--line); }
-#browse-status.error { color: #ffb3a8; }
+#browse-status.error { margin-top: 0; }
 #log-text {
   flex: 1; margin: 0; padding: 10px 14px; overflow: auto;
   font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -149,3 +162,14 @@ dialog .bar { justify-content: space-between; border-bottom: 1px solid var(--lin
 }
 .grow { flex: 1; min-width: 0; }
 #drive-note button.link { display: inline; padding: 0; color: inherit; text-decoration: underline; }
+
+/* Phones and narrow windows: the open sidebar floats over the desktop instead
+   of squeezing it to a sliver; collapsed, it is the rail as above. */
+@media (max-width: 700px) {
+  body:not(.collapsed) #sidebar {
+    position: absolute; top: 0; bottom: 0; left: 0; z-index: 3;
+    width: min(340px, 100%);
+    box-shadow: 4px 0 16px rgba(0, 0, 0, .5);
+  }
+  dialog { width: 96vw; height: 90vh; }
+}

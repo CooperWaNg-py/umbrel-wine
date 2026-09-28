@@ -6,14 +6,17 @@
   <title>Wine</title>
   <!-- Every URL is relative so the page works behind any path prefix and on
        both http and https. -->
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div id="layout">
     <aside id="sidebar">
       <header class="bar">
-        <button id="toggle" class="icon" title="Hide sidebar" aria-label="Toggle sidebar">☰</button>
+        <button id="toggle" class="icon" title="Hide sidebar" aria-label="Hide sidebar" aria-controls="sidebar-body" aria-expanded="true">☰</button>
         <h1>Wine</h1>
+        <a id="open-tab" class="button icon" href="desktop/" target="_blank" rel="noopener"
+           title="Open desktop in new tab" aria-label="Open desktop in new tab">↗</a>
       </header>
 
       <div id="sidebar-body">
@@ -30,9 +33,19 @@
           </div>
           <div class="row buttons">
             <button id="drive-new">New drive</button>
-            <button id="drive-reset">Reset</button>
+            <button id="drive-reset" class="danger">Reset</button>
             <button id="drive-delete" class="danger">Delete</button>
           </div>
+          <form id="drive-form" hidden>
+            <div class="row">
+              <input id="drive-name" type="text" class="grow" maxlength="64" autocomplete="off"
+                     spellcheck="false" placeholder="Name, e.g. games" aria-label="New drive name"
+                     aria-describedby="drive-form-hint">
+              <button type="submit" class="primary">Create</button>
+              <button type="button" id="drive-form-cancel">Cancel</button>
+            </div>
+            <div id="drive-form-hint" class="muted hint" aria-live="polite"></div>
+          </form>
           <div class="row buttons">
             <button id="drive-browse">Browse drive files</button>
           </div>
@@ -44,9 +57,11 @@
           <div id="dropzone">
             <span>Drop <b>.exe</b> files or program folders here</span>
             <div class="row buttons">
-              <label class="button">Choose .exe files<input id="file-input" type="file" accept=".exe" multiple hidden></label>
-              <label class="button">Choose folder<input id="folder-input" type="file" webkitdirectory multiple hidden></label>
+              <button id="pick-files">Choose .exe files</button>
+              <button id="pick-folder">Choose folder</button>
             </div>
+            <input id="file-input" type="file" accept=".exe" multiple hidden>
+            <input id="folder-input" type="file" webkitdirectory multiple hidden>
           </div>
           <div class="muted hint">Upload the whole folder when a program needs DLLs or data files next to it.</div>
           <div id="upload" hidden>
@@ -57,7 +72,10 @@
               <button id="upload-cancel" class="danger">Cancel</button>
             </div>
           </div>
-          <div id="upload-error" class="error" hidden></div>
+          <div id="upload-error" class="error row" role="alert" hidden>
+            <span id="upload-error-text" class="grow"></span>
+            <button id="upload-error-close" class="icon" title="Dismiss" aria-label="Dismiss">✕</button>
+          </div>
         </section>
 
         <section>
@@ -79,16 +97,16 @@
     </aside>
 
     <main id="main">
-      <button id="toggle-open" class="icon floating" title="Show sidebar" aria-label="Show sidebar" hidden>☰</button>
       <iframe id="desktop" src="desktop/" title="Wine desktop"
               allow="fullscreen; clipboard-read; clipboard-write; gamepad; autoplay"></iframe>
-      <a id="open-tab" href="desktop/" target="_blank" rel="noopener">Open desktop in new tab</a>
+      <div id="desktop-wait" hidden>The desktop is starting… it reconnects on its own.</div>
     </main>
   </div>
 
   <dialog id="log-dialog">
     <header class="bar">
-      <h2 id="log-title">Log</h2>
+      <h2 id="log-title" class="grow ellipsis">Log</h2>
+      <a id="log-download" class="button" href="#" download>Download full log</a>
       <button id="log-close" class="icon" aria-label="Close">✕</button>
     </header>
     <pre id="log-text"></pre>
@@ -96,14 +114,15 @@
 
   <dialog id="browse-dialog">
     <header class="bar">
-      <h2 id="browse-title">Files</h2>
+      <h2 id="browse-title" class="grow ellipsis">Files</h2>
       <button id="browse-close" class="icon" aria-label="Close">✕</button>
     </header>
     <div id="browse-list-view" class="dialog-body">
       <div class="row toolbar">
         <nav id="browse-crumbs" class="crumbs" aria-label="Folder"></nav>
         <button id="browse-upload-cancel" class="danger" hidden>Cancel upload</button>
-        <label id="browse-upload" class="button">Upload here<input id="browse-upload-input" type="file" multiple hidden></label>
+        <button id="browse-upload">Upload here</button>
+        <input id="browse-upload-input" type="file" multiple hidden>
       </div>
       <div id="browse-hint" class="muted" hidden></div>
       <ul id="browse-list" class="list"></ul>
@@ -114,13 +133,20 @@
         <span id="editor-meta" class="muted"></span>
       </div>
       <div id="editor-note" class="warning" hidden>Wine rewrites registry files while programs run on this drive. Use “Stop all programs on this drive” before editing, or your change may be overwritten.</div>
+      <div id="editor-conflict" class="warning" role="alert" hidden>
+        <div>This file changed on disk since you opened it.</div>
+        <div class="row buttons">
+          <button id="editor-overwrite" class="danger">Overwrite with my version</button>
+          <button id="editor-reload">Reload from disk (discard my edits)</button>
+        </div>
+      </div>
       <textarea id="editor-text" spellcheck="false" aria-label="File contents"></textarea>
       <div class="row buttons">
-        <button id="editor-save" class="primary">Save</button>
+        <button id="editor-save" class="primary" title="Save (Ctrl+S / ⌘S)">Save</button>
         <button id="editor-close">Back to folder</button>
       </div>
     </div>
-    <div id="browse-status" class="muted"></div>
+    <div id="browse-status" class="muted" aria-live="polite"></div>
   </dialog>
 
   <script src="app.js"></script>
