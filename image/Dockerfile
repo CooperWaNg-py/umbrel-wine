@@ -16,7 +16,7 @@
 #
 # The base is pinned by its index digest too, from:
 #   docker buildx imagetools inspect ghcr.io/linuxserver/baseimage-selkies:debiantrixie
-FROM ghcr.io/linuxserver/baseimage-selkies:debiantrixie@sha256:d75c1d5a188e9b447785fc34b0e56d4d7ff120bdc4ba6d4be22ec4ce4b231758
+FROM ghcr.io/linuxserver/baseimage-selkies:debiantrixie@sha256:1439cfdbc0db4e2b6f2c2ca518b9d15cc16454acf9fc4536578747a6ffdb18e3
 
 ARG TARGETARCH
 
